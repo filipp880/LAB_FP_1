@@ -10,7 +10,7 @@ final class Menu(initialConfig: Config):
   private var key: Option[String] = None
   private var running = true
 
-  // Для терминала используется его кодировка, для IDEA и перенаправленного ввода — UTF-8.
+  // При отсутствии System.console() входной поток декодируется в UTF-8.
   private val input = new java.io.BufferedReader(Option(System.console()).map(_.reader()).getOrElse(
     new java.io.InputStreamReader(System.in, java.nio.charset.StandardCharsets.UTF_8)))
 
@@ -21,7 +21,7 @@ final class Menu(initialConfig: Config):
     println(e.message)
     logError(e)
 
-  // В журнал попадает только категория ошибки, без ключей и полного ввода пользователя.
+  // Журналирование ограничено категорией ошибки и наименованием операции.
   private def logError(e: AppError): Unit =
 
     val category = e match
@@ -29,11 +29,10 @@ final class Menu(initialConfig: Config):
       case _ => e.productPrefix
     event(s"Ошибка: $category")
 
-  // Показывает ошибку и прерывает текущую цепочку диалога через None.
   private def show[A](result: Either[AppError, A]): Option[A] =
     result.fold(e => { error(e); None }, Some(_))
 
-  // None означает конец ввода; пустая строка остаётся отдельным ответом.
+  // None обозначает EOF; пустой ответ представлен Some("").
   private def read(prompt: String): Option[String] =
     print(prompt)
     val value = Option(input.readLine()).map(_.trim)
@@ -197,7 +196,7 @@ final class Menu(initialConfig: Config):
       })
       _ <- show(if Files.exists(target) then Left(AppError.FileExists(target.toString)) else Right(()))
       encrypted <- yes("Зашифровать копии? Для открытия потребуется ключ.")
-      // Внешний Option означает успех диалога, внутренний — наличие ключа.
+      // Внешний Option — результат диалога; внутренний — наличие ключа.
       selectedKey <- if encrypted then newKey(name).map(Some(_)) else Some(None)
       add <- yes("Добавить файлы или папки для копирования сейчас?", true)
       initial <- if add then readSources() else Some(Nil)

@@ -4,7 +4,7 @@ import java.nio.file.{Files, Paths}
 import upickle.default.*
 import ModelJson.given
 
-// Удалённые источники остаются в списке, чтобы не сдвигать номера в старых снимках.
+// Индексы источников сохраняются после удаления для согласованности со снимками.
 final case class Source(
     path: String,
     includeSubdirs: Boolean,

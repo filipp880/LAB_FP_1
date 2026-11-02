@@ -16,7 +16,6 @@ object Container:
   private val BlobPrefix = "blobs/"
   def now(): String = LocalDateTime.now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
 
-  // Закрывает ZIP после выполнения переданного действия, в том числе при ошибке.
   private def withZip[A](path: Path)(body: ZipFile => Either[AppError, A]): Either[AppError, A] =
     Boundary.attempt("Чтение контейнера") {
       try Using.resource(new ZipFile(path.toFile))(body)
@@ -54,7 +53,7 @@ object Container:
     catch case _: AtomicMoveNotSupportedException =>
       Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING)
 
-  // Сначала полностью записывает временный файл, затем заменяет целевой.
+  // Замена целевого файла выполняется после завершения записи временного.
   private def replaceFile(target: Path, overwrite: Boolean)(write: Path => Unit): Unit =
     val temp = Files.createTempFile(target.getParent, target.getFileName.toString, ".tmp")
     try
@@ -62,7 +61,7 @@ object Container:
       if overwrite then move(temp, target) else Files.move(temp, target)
     finally Files.deleteIfExists(temp)
 
-  // Пересобирает контейнер, оставляя только блоки, нужные сохранённым снимкам.
+  // Набор ZIP-блоков определяется ссылками из сохранённых снимков.
   private def writeZip(meta: StorageMeta, blobs: Map[String, Array[Byte]],
                        key: Option[String], replacing: Boolean = true): Either[AppError, Unit] =
     val wanted = meta.versions.flatMap(_.snapshot.values.flatMap(_.hash)).toSet
@@ -116,7 +115,7 @@ object Container:
     if Files.notExists(meta.containerPath) then Left(AppError.FileMissing(meta.containerPath.toString))
     else keyFor(meta, key).flatMap(writeZip(meta, Map.empty, _))
 
-  // Лимит применяется к содержимому каждого файла, а не к количеству снимков.
+  // Ограничение истории содержимого применяется отдельно к каждому пути.
   private def retain(meta: StorageMeta, maximum: Int): StorageMeta =
     val paths = meta.versions.flatMap(_.snapshot.keys).toSet
     val allowed = paths.map { rel =>
@@ -134,7 +133,7 @@ object Container:
     }.filter(_._2.nonEmpty).toMap
     meta.copy(versions = versions, fileVersions = fileVersions)
 
-  // Повторно проверяет план перед записью; ошибки отдельных файлов не отменяют остальные.
+  // Несоответствие плану сканирования исключает файл из записи новых данных.
   def backup(meta: StorageMeta, key: Option[String], cfg: Config, plan: ScanPlan,
              comment: Option[String]): Either[AppError, (StorageMeta, BackupResult)] =
     keyFor(meta, key).flatMap { actualKey =>
@@ -190,7 +189,7 @@ object Container:
       }
     }
 
-  // Проверяет расшифрованные данные до перезаписи файла при восстановлении.
+  // Проверка целостности предшествует замене файла назначения.
   private def plainBlob(zip: ZipFile, hash: String, key: Option[String]): Either[AppError, Array[Byte]] =
     for
       stored <- entryBytes(zip, BlobPrefix + hash)
@@ -202,7 +201,7 @@ object Container:
   private def versionOf(meta: StorageMeta, number: Int): Either[AppError, VersionInfo] =
     meta.versions.find(_.number == number).toRight(AppError.VersionNotFound(number))
 
-  // Запрещает выход из каталога восстановления и переход через символьные ссылки.
+  // Проверка границ каталога назначения и символьных ссылок.
   private def safeTarget(dest: Path, rel: String): Either[AppError, Path] =
     Boundary.attempt("Проверка пути восстановления") {
       val root = dest.toAbsolutePath.normalize

@@ -4,7 +4,7 @@ import java.nio.file.Path
 import scala.util.control.NonFatal
 import upickle.default.*
 
-// JSON-представление Option и переименований сохраняет совместимость формата.
+// Совместимое JSON-представление необязательных строк и пар переименования.
 private[backup] object ModelJson:
   given ReadWriter[Option[String]] = readwriter[ujson.Value].bimap(
     _.fold[ujson.Value](ujson.Null)(ujson.Str(_)),
@@ -17,7 +17,7 @@ private[backup] object ModelJson:
 
 import ModelJson.given
 
-// hash=None отмечает удаление файла в этом снимке.
+// hash = None — маркер удаления в снимке.
 final case class FileRef(hash: Option[String], size: Long) derives ReadWriter
 
 final case class VersionInfo(
@@ -49,7 +49,7 @@ final case class StorageMeta(
   def lastVersion: Option[VersionInfo] = versions.maxByOption(_.number)
 
 object StorageMeta:
-  // Путь контейнера не записывается: после переноса используется фактический путь.
+  // Фактический путь контейнера исключён из сериализуемых метаданных.
   private case class Data(
       name: String,
       encrypted: Boolean,

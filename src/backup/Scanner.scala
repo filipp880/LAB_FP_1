@@ -11,7 +11,7 @@ object Scanner:
         prefix.drop(1).toIntOption.filter(_ >= 0)
       case _ => None
 
-  // Переводит внутренний путь sN/имя в исходный путь на диске.
+  // Формат внутреннего пути: s<индекс источника>/<относительный путь>.
   def resolveRel(meta: StorageMeta, rel: String): Option[Path] =
     for
       index <- sourceIndexOf(rel)
@@ -82,7 +82,7 @@ object Scanner:
       val changed = previous.flatMap(record => current.get(record.rel)
         .filter(_.hash != record.hash).map(record -> _)).sortBy(_._1.rel)
       val safelyScanned = walked.filter(_._3.isEmpty).map(_._1).toSet
-      // Удаление подтверждается только для успешно проверенного источника.
+      // Недоступные источники и источники с ошибками обхода исключены из определения удалений.
       val deleted = previous.filter { record =>
         !current.contains(record.rel) && record.srcIndex.exists { index =>
           safelyScanned(index) && meta.sources.lift(index).exists { source =>
@@ -93,7 +93,7 @@ object Scanner:
       }.sortBy(_.rel)
       val oldByHash = deleted.groupBy(record => (record.hash, record.size))
       val newByHash = newFiles.groupBy(file => (file.hash, file.size))
-      // Совпадение хеша и размера — предположение о переименовании.
+      // Эвристика переименования: совпадение хеша и размера.
       val renamed = oldByHash.keySet.intersect(newByHash.keySet).toList.sorted.flatMap { key =>
         oldByHash(key).zip(newByHash(key))
       }

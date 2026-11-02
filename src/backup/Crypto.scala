@@ -43,14 +43,14 @@ object Crypto:
     new SecureRandom().nextBytes(bytes)
     Base64.getEncoder.encodeToString(bytes)
 
-  // Проверочный хеш связывает ключ с названием хранилища; сам ключ здесь не сохраняется.
+  // Проверочное значение ключа зависит от названия хранилища.
   def keyCheck(key: String, name: String): String =
     hex(MessageDigest.getInstance("SHA-256").digest(s"$key:$name".getBytes(UTF_8)))
 
   private def aesKey(key: String): SecretKeySpec =
     new SecretKeySpec(MessageDigest.getInstance("SHA-256").digest(key.getBytes(UTF_8)), "AES")
 
-  // Блок содержит 12 байтов nonce, затем шифротекст с проверочной меткой AES-GCM.
+  // Формат блока: nonce (12 байт) || шифротекст || тег AES-GCM (16 байт).
   def encrypt(key: String, bytes: Array[Byte]): Either[AppError, Array[Byte]] =
     Boundary.attempt("Шифрование") {
       val nonce = new Array[Byte](12)

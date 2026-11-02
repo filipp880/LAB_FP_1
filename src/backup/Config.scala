@@ -23,7 +23,7 @@ object Config:
   val ConfigFileName = "backup.json"
   def defaultPath: Path = Paths.get(ConfigFileName).toAbsolutePath
 
-  // Типы JSON проверяются явно, без неявного преобразования строк и чисел.
+  // Строгая проверка типов полей JSON без неявных преобразований.
   private def parse(text: String): Either[AppError, Config] =
     try
 
@@ -41,7 +41,7 @@ object Config:
 
   def toJson(config: Config): ujson.Value = writeJs(config)
 
-  // Читает и проверяет настройки; отсутствие файла при reload считается ошибкой.
+  // Отсутствие конфигурационного файла при reload является ошибкой.
   def load(path: Path): Either[AppError, Config] =
     val loaded = Boundary.attempt("Чтение конфигурации")(Files.readString(path, UTF_8)).flatMap(parse)
     loaded.flatMap(config => validate(config).map(_ => config))

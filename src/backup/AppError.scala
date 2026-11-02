@@ -24,7 +24,7 @@ enum AppError(val message: String):
 
 object Boundary:
 
-  // Исключения внешнего API преобразуются в типизированные ошибки приложения.
+  // Граница преобразования исключений внешних API в AppError.
   def attempt[A](operation: String)(body: => A): Either[AppError, A] =
     try Right(body)
     catch

@@ -4,7 +4,7 @@ import java.nio.file.{Files, Path, StandardCopyOption}
 import java.util.zip.{ZipEntry, ZipFile, ZipOutputStream}
 import scala.jdk.CollectionConverters.*
 
-// Интеграционные проверки используют отдельную временную папку.
+// Изоляция тестовых данных во временном каталоге.
 @main def backupChecks(): Unit =
   val root = Files.createTempDirectory("backup-checks-")
   var passed = 0
@@ -23,7 +23,7 @@ import scala.jdk.CollectionConverters.*
     val zip = new ZipFile(path.toFile)
     try zip.entries().asScala.map(_.getName).filter(_.startsWith("blobs/")).toList
     finally zip.close()
-  // Намеренно повреждает один блок, сохраняя корректную структуру ZIP.
+  // Контролируемое повреждение одного блока при сохранении структуры ZIP.
   def rewriteBlob(path: Path): Unit =
     val zip = new ZipFile(path.toFile)
     val tmp = path.resolveSibling(path.getFileName.toString + ".test-tmp")
