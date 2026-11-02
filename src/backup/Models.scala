@@ -67,6 +67,7 @@ object StorageMeta:
     value("format") = 2
     value
 
+  // Десериализация и валидация метаданных с учётом версии формата.
   def fromJson(value: ujson.Value, path: Path): Either[AppError, StorageMeta] =
     try
       val format = value("format").num

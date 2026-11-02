@@ -28,6 +28,7 @@ object Scanner:
       Glob.matches(pattern, rel) || rel.split("/").exists(Glob.matches(pattern, _))
     }
 
+  // Обход источника с раздельным накоплением файлов и ошибок обработки.
   private def walk(index: Int, source: Source, algo: String, defaults: List[String],
                    protectedPaths: List[Path]): (List[WalkedFile], List[AppError]) =
     val files = List.newBuilder[WalkedFile]

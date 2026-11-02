@@ -38,6 +38,7 @@ object Container:
       }
     }
 
+  // Проверка обязательности ключа и его соответствия метаданным.
   private def keyFor(meta: StorageMeta, key: Option[String]): Either[AppError, Option[String]] =
     if !meta.encrypted then Right(None)
     else key.filter(_.nonEmpty).toRight(AppError.KeyRequired).flatMap { value =>
@@ -218,6 +219,7 @@ object Container:
       else Right(target)
     }
 
+  // Предварительное выявление конфликтов путей назначения для выбранного снимка.
   def restoreConflicts(meta: StorageMeta, number: Int, dest: Path): Either[AppError, List[String]] =
     versionOf(meta, number).flatMap { version =>
       version.snapshot.toList.filter(_._2.hash.nonEmpty).sortBy(_._1)
@@ -255,6 +257,7 @@ object Container:
       }
     yield result
 
+  // Проверка уникальных блоков, используемых сохранёнными снимками.
   def verify(meta: StorageMeta, key: Option[String]): Either[AppError, VerifyResult] =
     keyFor(meta, key).flatMap { actualKey => withZip(meta.containerPath) { zip =>
       val hashes = meta.versions.flatMap(_.snapshot.values.flatMap(_.hash)).distinct

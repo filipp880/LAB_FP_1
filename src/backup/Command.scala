@@ -15,6 +15,7 @@ enum Command:
 object Command:
   def positiveInt(text: String): Option[Int] = text.toIntOption.filter(_ > 0)
 
+  // Синтаксический разбор ввода с формированием типизированной команды.
   def parse(line: String): Either[AppError, Command] =
     def number(text: String): Either[AppError, Int] =
       positiveInt(text).toRight(AppError.InvalidInput("Нужен положительный целый номер"))

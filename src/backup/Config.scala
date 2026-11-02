@@ -46,6 +46,7 @@ object Config:
     val loaded = Boundary.attempt("Чтение конфигурации")(Files.readString(path, UTF_8)).flatMap(parse)
     loaded.flatMap(config => validate(config).map(_ => config))
 
+  // Проверка ограничений конфигурации и доступности служебных путей.
   def validate(config: Config): Either[AppError, Unit] =
     if config.logFile.trim.isEmpty then Left(AppError.InvalidConfig("Путь к журналу не указан"))
     else if config.keyDirectory.trim.isEmpty then Left(AppError.InvalidConfig("Каталог для ключей не указан"))

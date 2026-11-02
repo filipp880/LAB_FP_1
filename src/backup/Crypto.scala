@@ -22,6 +22,7 @@ object Crypto:
       hex(MessageDigest.getInstance(a).digest(bytes))
     })
 
+  // Потоковое хеширование без загрузки файла целиком в память.
   def hash(algo: String, in: InputStream): Either[AppError, String] =
     normalize(algo).flatMap(a => Boundary.attempt("Чтение файла") {
       val digest = MessageDigest.getInstance(a)
