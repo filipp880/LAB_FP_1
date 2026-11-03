@@ -1,11 +1,10 @@
 package backup
 
 import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{Files, Path, Paths}
+import java.nio.file.{Files, NoSuchFileException, Path, Paths}
 import scala.util.control.NonFatal
-import upickle.default.*
 
-final case class Config(
+case class Config(
     logFile: String,
     keyDirectory: String,
     defaultContainerName: String,
@@ -15,64 +14,90 @@ final case class Config(
     maximumVersionsPerFile: Int,
     hashAlgorithm: String,
     defaultExclusions: List[String]
-) derives ReadWriter
+)
 
 object Config:
   val Default = Config("backup.log", "keys", "backup.store", true, true, true,
     10, "SHA-256", List("*.tmp", "*.log", "cache", "node_modules"))
-  val ConfigFileName = "backup.json"
-  def defaultPath: Path = Paths.get(ConfigFileName).toAbsolutePath
+  val defaultPath: Path = Paths.get("backup.json")
 
-  // Строгая проверка типов полей JSON без неявных преобразований.
+  // str читает строку JSON, bool — логическое значение, num — число.
   private def parse(text: String): Either[AppError, Config] =
     try
-
-      val value = ujson.read(text)
-      val maximum = value("maximumVersionsPerFile").num
-      if maximum != maximum.toInt.toDouble then Left(AppError.InvalidConfig("Число версий должно быть целым Int"))
-      else Right(Config(
-        value("logFile").str, value("keyDirectory").str,
-        value("defaultContainerName").str, value("checkOnStorageOpen").bool,
-        value("confirmBeforeBackup").bool, value("confirmBeforeRestoreOverwrite").bool,
-        maximum.toInt, value("hashAlgorithm").str,
-        value("defaultExclusions").arr.map(_.str).toList
-      ))
+      val json = ujson.read(text)
+      val maximum = json("maximumVersionsPerFile").num
+      val wholeNumber = maximum.toInt
+      val exclusionValues = json("defaultExclusions").arr.toList
+      val exclusions = exclusionValues.map(value => value.str)
+      if maximum != wholeNumber.toDouble then
+        Left(AppError.InvalidConfig("Число версий должно быть целым Int"))
+      else
+        Right(Config(
+          json("logFile").str,
+          json("keyDirectory").str,
+          json("defaultContainerName").str,
+          json("checkOnStorageOpen").bool,
+          json("confirmBeforeBackup").bool,
+          json("confirmBeforeRestoreOverwrite").bool,
+          wholeNumber,
+          json("hashAlgorithm").str,
+          exclusions
+        ))
     catch case NonFatal(_) => Left(AppError.InvalidConfig("Неправильный формат JSON или тип поля"))
 
-  def toJson(config: Config): ujson.Value = writeJs(config)
+  def toJson(config: Config): ujson.Value =
+    val json = ujson.Obj()
+    json("logFile") = config.logFile
+    json("keyDirectory") = config.keyDirectory
+    json("defaultContainerName") = config.defaultContainerName
+    json("checkOnStorageOpen") = config.checkOnStorageOpen
+    json("confirmBeforeBackup") = config.confirmBeforeBackup
+    json("confirmBeforeRestoreOverwrite") = config.confirmBeforeRestoreOverwrite
+    json("maximumVersionsPerFile") = config.maximumVersionsPerFile
+    json("hashAlgorithm") = config.hashAlgorithm
+    json("defaultExclusions") = ujson.Arr.from(config.defaultExclusions)
+    json
 
-  // Отсутствие конфигурационного файла при reload является ошибкой.
   def load(path: Path): Either[AppError, Config] =
-    val loaded = Boundary.attempt("Чтение конфигурации")(Files.readString(path, UTF_8)).flatMap(parse)
-    loaded.flatMap(config => validate(config).map(_ => config))
+    try
+      parse(Files.readString(path, UTF_8)).flatMap { config =>
+        validate(config).map(_ => config)
+      }
+    catch
+      case _: NoSuchFileException => Left(AppError.FileMissing(path.toString))
+      case NonFatal(_) => Left(AppError.ReadFailed(path.toString))
 
-  // Проверка ограничений конфигурации и доступности служебных путей.
   def validate(config: Config): Either[AppError, Unit] =
     if config.logFile.trim.isEmpty then Left(AppError.InvalidConfig("Путь к журналу не указан"))
     else if config.keyDirectory.trim.isEmpty then Left(AppError.InvalidConfig("Каталог для ключей не указан"))
     else if config.defaultContainerName.trim.isEmpty then Left(AppError.InvalidConfig("Имя контейнера не указано"))
     else if config.maximumVersionsPerFile < 1 then Left(AppError.InvalidConfig("Максимальное количество версий меньше единицы"))
-    else Crypto.normalize(config.hashAlgorithm).flatMap { _ =>
-      config.defaultExclusions.find(pattern => !Glob.isValidPattern(pattern)) match
-        case Some(pattern) => Left(AppError.InvalidPattern(pattern))
-        case None =>
-          try
-            val log = Paths.get(config.logFile).toAbsolutePath
-            val keys = Paths.get(config.keyDirectory).toAbsolutePath
-            val name = Paths.get(config.defaultContainerName)
-            if name.isAbsolute || name.getNameCount != 1 || Set(".", "..").contains(config.defaultContainerName) then
-              Left(AppError.InvalidConfig("Имя контейнера должно быть именем файла без каталога"))
-            else
-              Files.createDirectories(keys)
-              if !Files.isWritable(keys) then Left(AppError.InvalidConfig("Каталог ключей недоступен для записи"))
-              else if Files.exists(log) && (!Files.isRegularFile(log) || !Files.isWritable(log)) then
-                Left(AppError.InvalidConfig("Журнал недоступен для записи"))
-              else Right(())
-          catch case NonFatal(_) => Left(AppError.InvalidConfig("Некорректный путь или невозможно создать каталог ключей"))
-    }
+    else
+      Crypto.normalize(config.hashAlgorithm).flatMap { _ =>
+        config.defaultExclusions.find(pattern => !Glob.isValidPattern(pattern)) match
+          case Some(pattern) => Left(AppError.InvalidPattern(pattern))
+          case None => validatePaths(config)
+      }
+
+  private def validatePaths(config: Config): Either[AppError, Unit] =
+    try
+      val log = Paths.get(config.logFile)
+      val keys = Paths.get(config.keyDirectory)
+      val name = config.defaultContainerName
+      val hasDirectory = name.contains("/") || name.contains("\\")
+      if hasDirectory || name == "." || name == ".." then
+        Left(AppError.InvalidConfig("Имя контейнера должно быть именем файла без каталога"))
+      else if Files.exists(keys) && !Files.isDirectory(keys) then
+        Left(AppError.InvalidConfig("По пути каталога ключей находится файл"))
+      else if Files.isDirectory(log) then
+        Left(AppError.InvalidConfig("Вместо файла журнала указан каталог"))
+      else Right(())
+    catch case NonFatal(_) => Left(AppError.InvalidConfig("Некорректный путь в настройках"))
 
   def save(path: Path, config: Config): Either[AppError, Unit] =
-    validate(config).flatMap(_ => Boundary.attempt("Запись конфигурации") {
-      Files.writeString(path, write(config, indent = 2), UTF_8)
-      ()
-    })
+    validate(config).flatMap { _ =>
+      try
+        Files.writeString(path, ujson.write(toJson(config), indent = 2), UTF_8)
+        Right(())
+      catch case NonFatal(_) => Left(AppError.WriteFailed(path.toString))
+    }

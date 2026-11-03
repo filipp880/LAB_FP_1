@@ -16,7 +16,8 @@ import scala.jdk.CollectionConverters.*
     case Right(a) => a
     case Left(e) => throw new AssertionError(s"Ожидался Right, получен $e; данные: $root")
   def put(path: Path, text: String): Unit =
-    Files.createDirectories(path.getParent)
+    val folder = path.getParent.toFile
+    if !folder.exists() then folder.mkdirs()
     Files.writeString(path, text)
   def text(path: Path): String = Files.readString(path)
   def blobNames(path: Path): List[String] =
@@ -60,6 +61,7 @@ import scala.jdk.CollectionConverters.*
 
   check("конфигурация: валидация и JSON round-trip") {
     value(Config.validate(cfg))
+    assert(!Files.exists(root.resolve("keys")))
     val path = root.resolve("backup.json")
     value(Config.save(path, cfg))
     assert(value(Config.load(path)) == cfg)
@@ -123,10 +125,10 @@ import scala.jdk.CollectionConverters.*
   put(source.resolve("cache/ignored.txt"), "ignored")
   check("сканирование: рекурсия и исключения") {
     val plan = scan(meta)
-    assert(plan.report.newFiles.map(_.rel).toSet == Set("s0/a.txt", "s0/b.txt", "s0/sub/deep.txt"))
+    assert(plan.report.newFiles.map(_.rel) == List("s0/a.txt", "s0/b.txt", "s0/sub/deep.txt"))
     assert(plan.report.totalNewBytes == 3)
     val shallow = meta.copy(sources = meta.sources.map(_.copy(includeSubdirs = false)))
-    assert(scan(shallow).report.newFiles.map(_.rel).toSet == Set("s0/a.txt", "s0/b.txt"))
+    assert(scan(shallow).report.newFiles.map(_.rel) == List("s0/a.txt", "s0/b.txt"))
   }
   val first = backup(meta)
   meta = first._1
@@ -187,7 +189,7 @@ import scala.jdk.CollectionConverters.*
       List(Source(directory.toString, true, Nil))))
     val protectedPaths = List(keys, logPath, Config.defaultPath)
     val safe = value(Scanner.scan(protectedMeta, cfg.hashAlgorithm, Nil, protectedPaths))
-    assert(safe.report.newFiles.map(_.rel).toSet == Set("s0/ordinary.txt"))
+    assert(safe.report.newFiles.map(_.rel) == List("s0/ordinary.txt"))
 
     val unsafePlan = value(Scanner.scan(protectedMeta, cfg.hashAlgorithm, Nil))
     assert(unsafePlan.report.newFiles.exists(_.rel == "s0/keys/saved.key"))
@@ -206,7 +208,7 @@ import scala.jdk.CollectionConverters.*
   meta = backup(meta)._1
   check("повторный blob не создаёт дубликат ZIP entry") {
     val names = blobNames(store)
-    assert(names.size == 2 && names.distinct == names)
+    assert(names.size == 2 && names(0) != names(1))
   }
 
   put(source.resolve("a.txt"), "A2")
@@ -237,7 +239,7 @@ import scala.jdk.CollectionConverters.*
     assert(value(Container.restoreConflicts(meta, last, latestDest)).contains("s0/a.txt"))
     value(Container.restore(meta, None, last, latestDest))
     assert(text(latestDest.resolve("s0/a.txt")) == "local edits")
-    value(Container.restore(meta, None, last, latestDest, Set("s0/a.txt")))
+    value(Container.restore(meta, None, last, latestDest, List("s0/a.txt")))
     assert(text(latestDest.resolve("s0/a.txt")) == "A2")
     assert(Container.restore(meta, None, 999, latestDest).isLeft)
   }
@@ -271,7 +273,11 @@ import scala.jdk.CollectionConverters.*
       put(source.resolve("a.txt"), content)
       meta = backup(meta, limited)._1
     }
-    val refs = meta.versions.flatMap(_.snapshot.get("s0/a.txt").flatMap(_.hash)).distinct
+    var refs = List.empty[String]
+    for version <- meta.versions do
+      version.snapshot.get("s0/a.txt").flatMap(_.hash).foreach { hash =>
+        if !refs.contains(hash) then refs = refs :+ hash
+      }
     assert(refs.size <= 2)
     val unchanged = meta.versions.flatMap(_.snapshot.get("s0/copy.txt").flatMap(_.hash))
     assert(unchanged.nonEmpty)
@@ -327,7 +333,7 @@ import scala.jdk.CollectionConverters.*
     val damaged = Container.verify(encrypted, key)
     assert(damaged.isLeft || damaged.toOption.exists(_.damaged.nonEmpty))
     put(destination.resolve("s0/secret.txt"), "keep this")
-    val restored = value(Container.restore(encrypted, key, 1, destination, Set("s0/secret.txt")))
+    val restored = value(Container.restore(encrypted, key, 1, destination, List("s0/secret.txt")))
     assert(restored.problems.nonEmpty)
     assert(text(destination.resolve("s0/secret.txt")) == "keep this")
   }

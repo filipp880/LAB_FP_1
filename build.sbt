@@ -5,7 +5,8 @@ ThisBuild / version      := "0.1.0"
 lazy val root = (project in file("."))
   .settings(
     name := "backup",
-    libraryDependencies += "com.lihaoyi" %% "upickle" % "4.1.0",
+    libraryDependencies += "com.lihaoyi" %% "ujson" % "4.1.0",
     Compile / unmanagedSourceDirectories += baseDirectory.value / "src" / "backup",
+    Test / unmanagedSourceDirectories += baseDirectory.value / "tests",
     Compile / run / connectInput := true
   )

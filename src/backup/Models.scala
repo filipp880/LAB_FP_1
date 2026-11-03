@@ -2,25 +2,19 @@ package backup
 
 import java.nio.file.Path
 import scala.util.control.NonFatal
-import upickle.default.*
 
-// Совместимое JSON-представление необязательных строк и пар переименования.
-private[backup] object ModelJson:
-  given ReadWriter[Option[String]] = readwriter[ujson.Value].bimap(
-    _.fold[ujson.Value](ujson.Null)(ujson.Str(_)),
-    value => if value == ujson.Null then None else Some(value.str)
-  )
-  given ReadWriter[(String, String)] = readwriter[ujson.Value].bimap(
-    pair => ujson.Obj("from" -> pair._1, "to" -> pair._2),
-    value => (value("from").str, value("to").str)
-  )
+object ModelJson:
+  def optionalText(value: Option[String]): ujson.Value = value match
+    case Some(text) => ujson.Str(text)
+    case None => ujson.Null
 
-import ModelJson.given
+  def readOptionalText(value: ujson.Value): Option[String] =
+    if value == ujson.Null then None else Some(value.str)
 
 // hash = None — маркер удаления в снимке.
-final case class FileRef(hash: Option[String], size: Long) derives ReadWriter
+case class FileRef(hash: Option[String], size: Long)
 
-final case class VersionInfo(
+case class VersionInfo(
     number: Int,
     timestamp: String,
     comment: Option[String],
@@ -31,11 +25,11 @@ final case class VersionInfo(
     renamed: List[(String, String)],
     bytes: Long,
     snapshot: Map[String, FileRef]
-) derives ReadWriter:
+):
   def summary: String =
     s"$number  $timestamp  +${added.size}  ~${modified.size}  -${deleted.size}  $result  ${comment.getOrElse("")}"
 
-final case class StorageMeta(
+case class StorageMeta(
     name: String,
     containerPath: Path,
     encrypted: Boolean,
@@ -46,26 +40,82 @@ final case class StorageMeta(
     fileVersions: Map[String, List[Int]],
     cipher: String = "AES/GCM/NoPadding"
 ):
-  def lastVersion: Option[VersionInfo] = versions.maxByOption(_.number)
+  def lastVersion: Option[VersionInfo] =
+    var latest: Option[VersionInfo] = None
+    for version <- versions do
+      latest match
+        case None => latest = Some(version)
+        case Some(saved) =>
+          if version.number > saved.number then latest = Some(version)
+    latest
 
 object StorageMeta:
-  // Фактический путь контейнера исключён из сериализуемых метаданных.
-  private case class Data(
-      name: String,
-      encrypted: Boolean,
-      keyCheck: Option[String],
-      created: String,
-      sources: List[Source],
-      versions: List[VersionInfo],
-      fileVersions: Map[String, List[Int]],
-      cipher: String = "AES/GCM/NoPadding"
-  ) derives ReadWriter
+  private def versionToJson(version: VersionInfo): ujson.Value =
+    val snapshot = ujson.Obj()
+    for (path, file) <- version.snapshot do
+      val record = ujson.Obj()
+      record("hash") = ModelJson.optionalText(file.hash)
+      record("size") = ujson.Num(file.size.toDouble)
+      snapshot(path) = record
+    val renamed = version.renamed.map { case (from, to) =>
+      val pair = ujson.Obj()
+      pair("from") = from
+      pair("to") = to
+      pair
+    }
+    val json = ujson.Obj()
+    json("number") = version.number
+    json("timestamp") = version.timestamp
+    json("comment") = ModelJson.optionalText(version.comment)
+    json("result") = version.result
+    json("added") = ujson.Arr.from(version.added)
+    json("modified") = ujson.Arr.from(version.modified)
+    json("deleted") = ujson.Arr.from(version.deleted)
+    json("renamed") = ujson.Arr.from(renamed)
+    json("bytes") = ujson.Num(version.bytes.toDouble)
+    json("snapshot") = snapshot
+    json
+
+  private def versionFromJson(value: ujson.Value): VersionInfo =
+    var snapshot = Map.empty[String, FileRef]
+    for (path, file) <- value("snapshot").obj do
+      val hash = ModelJson.readOptionalText(file("hash"))
+      val size = file("size").num.toLong
+      snapshot = snapshot.updated(path, FileRef(hash, size))
+    val renamedValues = value("renamed").arr.toList
+    val renamed = renamedValues.map { pair =>
+      (pair("from").str, pair("to").str)
+    }
+    val addedValues = value("added").arr.toList
+    val added = addedValues.map(item => item.str)
+    val modifiedValues = value("modified").arr.toList
+    val modified = modifiedValues.map(item => item.str)
+    val deletedValues = value("deleted").arr.toList
+    val deleted = deletedValues.map(item => item.str)
+    VersionInfo(
+      value("number").num.toInt, value("timestamp").str,
+      ModelJson.readOptionalText(value("comment")), value("result").str,
+      added, modified, deleted, renamed, value("bytes").num.toLong, snapshot
+    )
 
   def toJson(meta: StorageMeta): ujson.Value =
-    val value = writeJs(Data(meta.name, meta.encrypted, meta.keyCheck, meta.created,
-      meta.sources, meta.versions, meta.fileVersions, meta.cipher))
-    value("format") = 2
-    value
+    // Путь файла не сохраняем: контейнер можно перенести в другую папку.
+    val sources = meta.sources.map(source => Source.toJson(source))
+    val versions = meta.versions.map(version => versionToJson(version))
+    val fileVersions = ujson.Obj()
+    for (path, numbers) <- meta.fileVersions do
+      fileVersions(path) = ujson.Arr.from(numbers)
+    val json = ujson.Obj()
+    json("format") = 2
+    json("name") = meta.name
+    json("encrypted") = meta.encrypted
+    json("keyCheck") = ModelJson.optionalText(meta.keyCheck)
+    json("created") = meta.created
+    json("sources") = ujson.Arr.from(sources)
+    json("versions") = ujson.Arr.from(versions)
+    json("fileVersions") = fileVersions
+    json("cipher") = meta.cipher
+    json
 
   // Десериализация и валидация метаданных с учётом версии формата.
   def fromJson(value: ujson.Value, path: Path): Either[AppError, StorageMeta] =
@@ -75,23 +125,44 @@ object StorageMeta:
       else if format == 1 && value("encrypted").bool then
         Left(AppError.DamagedStorage("Старое шифрование: экспортируйте файлы через ЛР0 и создайте новое хранилище"))
       else
-        val migrated = ujson.Obj.from(value.obj)
-        if !migrated("encrypted").bool then migrated("keyCheck") = ujson.Null
-        val data = read[Data](migrated)
-        val badVersion = data.versions.exists(v => v.number < 1 || v.bytes < 0 ||
-          v.snapshot.values.exists(f => f.size < 0 || f.hash.exists(_.isEmpty)))
-        if data.name.trim.isEmpty || data.created.isEmpty || badVersion ||
-            data.versions.map(_.number).distinct.size != data.versions.size ||
-            (data.encrypted && (data.keyCheck.forall(_.isEmpty) || data.cipher != "AES/GCM/NoPadding")) then
+        val encrypted = value("encrypted").bool
+        val check = if encrypted then ModelJson.readOptionalText(value("keyCheck")) else None
+        var history = Map.empty[String, List[Int]]
+        for (filePath, numbers) <- value("fileVersions").obj do
+          val numberValues = numbers.arr.toList
+          val versionNumbers = numberValues.map(number => number.num.toInt)
+          history = history.updated(filePath, versionNumbers)
+        val sourceValues = value("sources").arr.toList
+        val sources = sourceValues.map(source => Source.fromJson(source))
+        val versionValues = value("versions").arr.toList
+        val versions = versionValues.map(version => versionFromJson(version))
+        val cipher = value.obj.get("cipher") match
+          case Some(name) => name.str
+          case None => "AES/GCM/NoPadding"
+        val meta = StorageMeta(
+          value("name").str, path, encrypted, check, value("created").str,
+          sources, versions, history, cipher
+        )
+        var badVersion = false
+        var seenNumbers = List.empty[Int]
+        for version <- versions do
+          if version.number < 1 || version.bytes < 0 then badVersion = true
+          if seenNumbers.contains(version.number) then badVersion = true
+          seenNumbers = seenNumbers :+ version.number
+          for (_, file) <- version.snapshot do
+            val emptyHash = file.hash.exists(hash => hash.isEmpty)
+            if file.size < 0 || emptyHash then badVersion = true
+        val hasKey = meta.keyCheck.exists(key => key.nonEmpty)
+        val badEncryption = meta.encrypted && (!hasKey || meta.cipher != "AES/GCM/NoPadding")
+        if meta.name.trim.isEmpty || meta.created.isEmpty || badVersion || badEncryption then
           Left(AppError.DamagedStorage("Некорректные метаданные"))
-        else Right(StorageMeta(data.name, path, data.encrypted, data.keyCheck, data.created,
-          data.sources, data.versions, data.fileVersions, data.cipher))
+        else Right(meta)
     catch case NonFatal(_) => Left(AppError.DamagedStorage("Некорректный JSON хранилища"))
 
-final case class WalkedFile(rel: String, size: Long, mtime: Long, hash: String)
-final case class LastRecord(rel: String, hash: String, size: Long, srcIndex: Option[Int])
+case class WalkedFile(rel: String, size: Long, mtime: Long, hash: String)
+case class LastRecord(rel: String, hash: String, size: Long, srcIndex: Option[Int])
 
-final case class ChangeReport(
+case class ChangeReport(
     newFiles: List[WalkedFile],
     changed: List[(LastRecord, WalkedFile)],
     deleted: List[LastRecord],
@@ -100,16 +171,19 @@ final case class ChangeReport(
     unavailableSources: List[String],
     scannedCount: Int
 ):
-  def totalNewBytes: Long = newFiles.map(_.size).sum + changed.map(_._2.size).sum
+  def totalNewBytes: Long =
+    val newBytes = newFiles.map(file => file.size).sum
+    val modifiedBytes = changed.map { case (_, file) => file.size }.sum
+    newBytes + modifiedBytes
   def isEmpty: Boolean = newFiles.isEmpty && changed.isEmpty && deleted.isEmpty &&
     renamed.isEmpty && unreadable.isEmpty && unavailableSources.isEmpty
 
-final case class ScanPlan(
+case class ScanPlan(
     report: ChangeReport,
     problems: List[AppError],
-    scannedSources: Set[Int]
+    scannedSources: List[Int]
 )
-final case class BackupResult(
+case class BackupResult(
     version: VersionInfo,
     added: Int,
     updated: Int,

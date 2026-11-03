@@ -13,12 +13,17 @@ enum Command:
   case Restore(version: Option[Int])
 
 object Command:
-  def positiveInt(text: String): Option[Int] = text.toIntOption.filter(_ > 0)
+  def positiveInt(text: String): Option[Int] =
+    text.toIntOption match
+      case Some(number) if number > 0 => Some(number)
+      case _ => None
 
   // Синтаксический разбор ввода с формированием типизированной команды.
   def parse(line: String): Either[AppError, Command] =
     def number(text: String): Either[AppError, Int] =
-      positiveInt(text).toRight(AppError.InvalidInput("Нужен положительный целый номер"))
+      positiveInt(text) match
+        case Some(value) => Right(value)
+        case None => Left(AppError.InvalidInput("Нужен положительный целый номер"))
     line.trim.split("\\s+").toList match
       case ("11" | "help" | "") :: Nil => Right(Help)
       case ("1" | "create") :: Nil => Right(Create)
@@ -30,7 +35,8 @@ object Command:
       case ("10" | "reload") :: Nil => Right(Reload)
       case "exit" :: Nil | "0" :: Nil => Right(Exit)
       case "6" :: Nil => Right(Backup(None))
-      case "backup" :: words => Right(Backup(Option.when(words.nonEmpty)(words.mkString(" "))))
+      case "backup" :: Nil => Right(Backup(None))
+      case "backup" :: words => Right(Backup(Some(words.mkString(" "))))
       case ("8" | "restore") :: Nil => Right(Restore(None))
       case "restore" :: n :: Nil => number(n).map(n => Restore(Some(n)))
       case ("4" | "sources") :: Nil => Right(Sources(SourceAction.Menu))

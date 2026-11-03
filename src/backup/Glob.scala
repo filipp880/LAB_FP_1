@@ -1,16 +1,20 @@
 package backup
 
 import java.nio.file.{FileSystems, PathMatcher, Paths}
+import scala.util.control.NonFatal
 
 object Glob:
   private def compile(pattern: String): Either[AppError, PathMatcher] =
-    if pattern.isEmpty || pattern.exists(c => c == '\n' || c == '\r') then
+    if pattern.isEmpty || pattern.contains("\n") || pattern.contains("\r") then
       Left(AppError.InvalidPattern(pattern))
-    else Boundary.attempt("Разбор glob-шаблона") {
-      FileSystems.getDefault.getPathMatcher("glob:" + pattern)
-    }.left.map(_ => AppError.InvalidPattern(pattern))
+    else
+      // Java проверяет шаблоны вроде *.tmp и [abc]. Свой разбор шаблонов не нужен.
+      try Right(FileSystems.getDefault.getPathMatcher("glob:" + pattern))
+      catch case NonFatal(_) => Left(AppError.InvalidPattern(pattern))
 
   def isValidPattern(pattern: String): Boolean = compile(pattern).isRight
 
   def matches(pattern: String, name: String): Boolean =
-    compile(pattern).toOption.exists(_.matches(Paths.get(name)))
+    compile(pattern) match
+      case Left(_) => false
+      case Right(matcher) => matcher.matches(Paths.get(name))

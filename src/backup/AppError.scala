@@ -1,8 +1,5 @@
 package backup
 
-import java.nio.file.{AccessDeniedException, FileAlreadyExistsException, NoSuchFileException}
-import scala.util.control.NonFatal
-
 enum AppError(val message: String):
   case UnknownCommand extends AppError("Такого пункта или команды нет. Введите номер из главного меню, например 1.")
   case InvalidInput(reason: String) extends AppError(s"Некорректный ввод: $reason")
@@ -20,15 +17,13 @@ enum AppError(val message: String):
   case FileChanged(path: String) extends AppError(s"Файл изменился во время копирования и пропущен: $path")
   case UnsupportedHash(name: String) extends AppError(s"Неподдерживаемый алгоритм хеша: $name")
   case InvalidPattern(pattern: String) extends AppError(s"Некорректное исключение: $pattern")
-  case Io(operation: String, detail: String) extends AppError(s"$operation: $detail")
-
-object Boundary:
-
-  // Граница преобразования исключений внешних API в AppError.
-  def attempt[A](operation: String)(body: => A): Either[AppError, A] =
-    try Right(body)
-    catch
-      case e: NoSuchFileException => Left(AppError.FileMissing(e.getFile))
-      case e: FileAlreadyExistsException => Left(AppError.FileExists(e.getFile))
-      case e: AccessDeniedException => Left(AppError.Io(operation, s"Нет доступа: ${e.getFile}"))
-      case NonFatal(e) => Left(AppError.Io(operation, Option(e.getMessage).getOrElse(e.getClass.getSimpleName)))
+  case ReadFailed(path: String) extends AppError(s"Не удалось прочитать файл: $path")
+  case WriteFailed(path: String) extends AppError(s"Не удалось записать файл: $path")
+  case FileListFailed(path: String) extends AppError(s"Не удалось прочитать список файлов каталога: $path")
+  case DirectoryCreateFailed(path: String) extends AppError(s"Не удалось создать каталог: $path")
+  case InvalidPath(reason: String) extends AppError(s"Некорректный путь: $reason")
+  case DestinationUnavailable(path: String) extends AppError(s"Каталог восстановления недоступен: $path")
+  case RestoreFailed(path: String) extends AppError(s"Не удалось восстановить файл: $path")
+  case HashFailed(name: String) extends AppError(s"Не удалось вычислить хеш алгоритмом $name")
+  case EncryptionFailed extends AppError("Не удалось зашифровать данные.")
+  case ScanFailed extends AppError("Не удалось проверить источники резервного копирования.")

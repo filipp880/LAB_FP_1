@@ -1,267 +1,363 @@
 package backup
 
-import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{AtomicMoveNotSupportedException, Files, Path, Paths, StandardCopyOption}
+import java.nio.file.{Files, Path, Paths, StandardCopyOption}
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
-import java.util.zip.{ZipEntry, ZipException, ZipFile, ZipOutputStream}
-import scala.jdk.CollectionConverters.*
-import scala.util.Using
+import java.util.zip.ZipFile
+import scala.collection.mutable.ArrayBuffer
+import scala.util.control.NonFatal
 
-final case class VerifyResult(ok: Int, damaged: List[String], missing: List[String])
-final case class RestoreResult(restored: Int, skipped: Int, problems: List[AppError])
+case class VerifyResult(ok: Int, damaged: List[String], missing: List[String])
+case class RestoreResult(restored: Int, skipped: Int, problems: List[AppError])
 
 object Container:
-  private val MetaEntry = "meta/filerecords.json"
-  private val BlobPrefix = "blobs/"
-  def now(): String = LocalDateTime.now.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+  private case class SavedFile(file: WalkedFile, bytes: Array[Byte])
 
-  private def withZip[A](path: Path)(body: ZipFile => Either[AppError, A]): Either[AppError, A] =
-    Boundary.attempt("Чтение контейнера") {
-      try Using.resource(new ZipFile(path.toFile))(body)
-      catch case _: ZipException => Left(AppError.DamagedStorage("Неверный ZIP-контейнер"))
-    }.flatMap(identity)
+  def now(): String =
+    val time = LocalDateTime.now()
+    val format = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+    time.format(format)
 
-  private def entryBytes(zip: ZipFile, name: String): Either[AppError, Array[Byte]] =
-    Option(zip.getEntry(name)).toRight(AppError.DamagedStorage(s"Отсутствует запись $name")).flatMap { entry =>
-      Boundary.attempt("Чтение записи контейнера") {
-        Using.resource(zip.getInputStream(entry))(_.readAllBytes())
-      }
-    }
+  def readMeta(path: Path): Either[AppError, StorageMeta] = ContainerFile.readMeta(path)
 
-  def readMeta(path: Path): Either[AppError, StorageMeta] =
-    withZip(path) { zip =>
-      entryBytes(zip, MetaEntry).flatMap { bytes =>
-        Boundary.attempt("Разбор метаданных")(ujson.read(new String(bytes, UTF_8)))
-          .left.map(_ => AppError.DamagedStorage("Неверный JSON метаданных"))
-          .flatMap(StorageMeta.fromJson(_, path))
-      }
-    }
-
-  // Проверка обязательности ключа и его соответствия метаданным.
   private def keyFor(meta: StorageMeta, key: Option[String]): Either[AppError, Option[String]] =
     if !meta.encrypted then Right(None)
-    else key.filter(_.nonEmpty).toRight(AppError.KeyRequired).flatMap { value =>
-      if meta.keyCheck.contains(Crypto.keyCheck(value, meta.name)) then Right(Some(value))
-      else Left(AppError.WrongKey)
-    }
+    else key match
+      case None => Left(AppError.KeyRequired)
+      case Some("") => Left(AppError.KeyRequired)
+      case Some(value) =>
+        if meta.keyCheck.contains(Crypto.keyCheck(value, meta.name)) then Right(Some(value))
+        else Left(AppError.WrongKey)
 
   def open(path: Path, key: Option[String]): Either[AppError, StorageMeta] =
-    readMeta(path).flatMap(meta => keyFor(meta, key).map(_ => meta))
-
-  private def move(temp: Path, target: Path): Unit =
-    try Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-    catch case _: AtomicMoveNotSupportedException =>
-      Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING)
-
-  // Замена целевого файла выполняется после завершения записи временного.
-  private def replaceFile(target: Path, overwrite: Boolean)(write: Path => Unit): Unit =
-    val temp = Files.createTempFile(target.getParent, target.getFileName.toString, ".tmp")
-    try
-      write(temp)
-      if overwrite then move(temp, target) else Files.move(temp, target)
-    finally Files.deleteIfExists(temp)
-
-  // Набор ZIP-блоков определяется ссылками из сохранённых снимков.
-  private def writeZip(meta: StorageMeta, blobs: Map[String, Array[Byte]],
-                       key: Option[String], replacing: Boolean = true): Either[AppError, Unit] =
-    val wanted = meta.versions.flatMap(_.snapshot.values.flatMap(_.hash)).toSet
-    val prepared = blobs.filter(entry => wanted(entry._1))
-      .foldLeft[Either[AppError, Map[String, Array[Byte]]]](Right(Map.empty)) { case (result, (hash, plain)) =>
-        for
-          all <- result
-          bytes <- key.fold[Either[AppError, Array[Byte]]](Right(plain))(Crypto.encrypt(_, plain))
-        yield all.updated(hash, bytes)
+    readMeta(path).flatMap { meta =>
+      keyFor(meta, key).map(_ => meta)
     }
-    prepared.flatMap { extra => Boundary.attempt("Запись контейнера") {
-      val target = meta.containerPath.toAbsolutePath
-      replaceFile(target, replacing) { temp =>
-        Using.resource(new ZipOutputStream(Files.newOutputStream(temp))) { out =>
-          val copied = scala.collection.mutable.Set.empty[String]
-          if replacing && Files.exists(target) then
-            Using.resource(new ZipFile(target.toFile)) { old =>
-              old.entries.asScala.filter(entry => entry.getName.startsWith(BlobPrefix)).foreach { entry =>
-                val hash = entry.getName.stripPrefix(BlobPrefix)
-                if wanted(hash) && !extra.contains(hash) && !copied(hash) then
-                  out.putNextEntry(new ZipEntry(entry.getName))
-                  Using.resource(old.getInputStream(entry))(_.transferTo(out))
-                  out.closeEntry()
-                  copied += hash
-              }
-            }
-          extra.toList.sortBy(_._1).foreach { case (hash, bytes) =>
-            out.putNextEntry(new ZipEntry(BlobPrefix + hash))
-            out.write(bytes)
-            out.closeEntry()
-          }
-          out.putNextEntry(new ZipEntry(MetaEntry))
-          out.write(ujson.write(StorageMeta.toJson(meta), indent = 2).getBytes(UTF_8))
-          out.closeEntry()
-        }
-      }
-    }}
 
-  def create(path: Path, name: String, encrypted: Boolean, key: Option[String],
-             sources: List[Source]): Either[AppError, StorageMeta] =
-    if Files.exists(path) then Left(AppError.FileExists(path.toString))
-    else if name.trim.isEmpty then Left(AppError.InvalidInput("Название хранилища пустое"))
-    else if encrypted && key.forall(_.isEmpty) then Left(AppError.KeyRequired)
-    else
-      val meta = StorageMeta(name, path, encrypted,
-        if encrypted then key.map(Crypto.keyCheck(_, name)) else None,
-        now(), sources, Nil, Map.empty)
-      writeZip(meta, Map.empty, None, replacing = false).map(_ => meta)
+  def create(
+      path: Path,
+      name: String,
+      encrypted: Boolean,
+      key: Option[String],
+      sources: List[Source]
+  ): Either[AppError, StorageMeta] =
+    if Files.exists(path) then
+      return Left(AppError.FileExists(path.toString))
+
+    if name.trim.isEmpty then
+      return Left(AppError.InvalidInput("Название хранилища пустое"))
+
+    var keyCheck: Option[String] = None
+    if encrypted then
+      key match
+        case None => return Left(AppError.KeyRequired)
+        case Some(value) =>
+          if value.isEmpty then
+            return Left(AppError.KeyRequired)
+          keyCheck = Some(Crypto.keyCheck(value, name))
+
+    val meta = StorageMeta(
+      name = name,
+      containerPath = path,
+      encrypted = encrypted,
+      keyCheck = keyCheck,
+      created = now(),
+      sources = sources,
+      versions = List.empty[VersionInfo],
+      fileVersions = Map.empty[String, List[Int]]
+    )
+    val fileContents = Map.empty[String, Array[Byte]]
+    val writeResult = ContainerFile.write(meta, fileContents, key = None, replacing = false)
+    writeResult.map(result => meta)
 
   def save(meta: StorageMeta, key: Option[String]): Either[AppError, Unit] =
     if Files.notExists(meta.containerPath) then Left(AppError.FileMissing(meta.containerPath.toString))
-    else keyFor(meta, key).flatMap(writeZip(meta, Map.empty, _))
+    else keyFor(meta, key).flatMap(value => ContainerFile.write(meta, Map.empty, value, true))
 
-  // Ограничение истории содержимого применяется отдельно к каждому пути.
+  // Идём от последней версии назад и собираем разные хеши одного файла.
+  private def latestHashes(path: String, versions: List[VersionInfo], maximum: Int): List[String] =
+    var hashes = List.empty[String]
+    var index = versions.length - 1
+    while index >= 0 && hashes.length < maximum do
+      val file = versions(index).snapshot.get(path)
+      val hash = file.flatMap(_.hash)
+      hash match
+        case Some(value) =>
+          if !hashes.contains(value) then hashes = hashes :+ value
+        case None => ()
+      index -= 1
+    hashes
+
   private def retain(meta: StorageMeta, maximum: Int): StorageMeta =
-    val paths = meta.versions.flatMap(_.snapshot.keys).toSet
-    val allowed = paths.map { rel =>
-      val hashes = meta.versions.reverse.flatMap(_.snapshot.get(rel).flatMap(_.hash)).distinct.take(maximum.max(1)).toSet
-      rel -> hashes
-    }.toMap
     val versions = meta.versions.map { version =>
-      val snapshot = version.snapshot.filter { case (rel, ref) => ref.hash.forall(allowed(rel)) }
-      version.copy(snapshot = snapshot,
-        result = if snapshot.size < version.snapshot.size then "partial: старые данные удалены по лимиту" else version.result)
+      val snapshot = version.snapshot.filter { case (path, ref) =>
+        ref.hash match
+          case None => true
+          case Some(hash) =>
+            val allowed = latestHashes(path, meta.versions, maximum)
+            allowed.contains(hash)
+      }
+      val result =
+        if snapshot.size < version.snapshot.size then "partial: старые данные удалены по лимиту"
+        else version.result
+      version.copy(snapshot = snapshot, result = result)
     }
-    val fileVersions = paths.map { rel =>
-      val changes = versions.filter(v => (v.added ++ v.modified).contains(rel) && v.snapshot.get(rel).exists(_.hash.nonEmpty))
-      rel -> changes.map(_.number).takeRight(maximum.max(1))
-    }.filter(_._2.nonEmpty).toMap
+    var paths = List.empty[String]
+    for version <- versions do
+      for path <- version.snapshot.keys do
+        if !paths.contains(path) then paths = paths :+ path
+
+    var fileVersions = Map.empty[String, List[Int]]
+    for path <- paths do
+      var numbers = List.empty[Int]
+      for version <- versions.reverse do
+        val wasChanged = version.added.contains(path) || version.modified.contains(path)
+        val file = version.snapshot.get(path)
+        val hash = file.flatMap(record => record.hash)
+        val hasContent = hash.nonEmpty
+        if wasChanged && hasContent && numbers.length < maximum then
+          numbers = version.number :: numbers
+      if numbers.nonEmpty then fileVersions = fileVersions.updated(path, numbers)
     meta.copy(versions = versions, fileVersions = fileVersions)
 
-  // Несоответствие плану сканирования исключает файл из записи новых данных.
+  private def readSource(meta: StorageMeta, cfg: Config, file: WalkedFile): Either[AppError, SavedFile] =
+    Scanner.resolveRel(meta, file.rel) match
+      case None => Left(AppError.FileChanged(file.rel))
+      case Some(path) =>
+        try
+          val protectedPaths = List(Paths.get(cfg.keyDirectory), Paths.get(cfg.logFile), Config.defaultPath, meta.containerPath)
+          val absolutePath = path.toAbsolutePath.normalize
+          val protectedFile = protectedPaths.exists { item =>
+            val protectedPath = item.toAbsolutePath.normalize
+            absolutePath.startsWith(protectedPath)
+          }
+          if protectedFile then Left(AppError.InvalidInput("Служебные файлы и ключи не включаются в резервную копию"))
+          else
+            val sizeBefore = Files.size(path)
+            val timeBefore = Files.getLastModifiedTime(path).toMillis
+            val bytes = Files.readAllBytes(path)
+            val sizeAfter = Files.size(path)
+            val timeAfter = Files.getLastModifiedTime(path).toMillis
+            Crypto.hash(cfg.hashAlgorithm, bytes).flatMap { hash =>
+              if sizeBefore != sizeAfter || timeBefore != timeAfter ||
+                  sizeAfter != file.size || timeAfter != file.mtime || hash != file.hash then
+                Left(AppError.FileChanged(path.toString))
+              else Right(SavedFile(file, bytes))
+            }
+        catch case NonFatal(_) => Left(AppError.ReadFailed(path.toString))
+
+  private def checkDeletion(meta: StorageMeta, record: LastRecord): Either[AppError, LastRecord] =
+    val source = record.srcIndex.flatMap(index => meta.sources.lift(index))
+    source match
+      case None => Left(AppError.FileChanged(record.rel))
+      case Some(value) if !value.available => Left(AppError.SourceMissing(value.path))
+      case Some(_) =>
+        Scanner.resolveRel(meta, record.rel) match
+          case Some(path) if Files.notExists(path) || Files.isDirectory(path) => Right(record)
+          case _ => Left(AppError.FileChanged(record.rel))
+
   def backup(meta: StorageMeta, key: Option[String], cfg: Config, plan: ScanPlan,
              comment: Option[String]): Either[AppError, (StorageMeta, BackupResult)] =
-    keyFor(meta, key).flatMap { actualKey =>
-      val files = plan.report.newFiles ++ plan.report.changed.map(_._2)
-      val attempted = files.map { file =>
-        for
-          path <- Scanner.resolveRel(meta, file.rel).toRight(AppError.FileChanged(file.rel))
-          _ <- Boundary.attempt("Проверка служебного пути") {
-            val protectedPaths = List(Paths.get(cfg.keyDirectory), Paths.get(cfg.logFile), Config.defaultPath, meta.containerPath)
-            !protectedPaths.exists(item => path.toAbsolutePath.normalize.startsWith(item.toAbsolutePath.normalize))
-          }.flatMap(allowed => if allowed then Right(()) else Left(AppError.InvalidInput("Служебные файлы и ключи не включаются в резервную копию")))
-          before <- Boundary.attempt("Свойства исходного файла")((Files.size(path), Files.getLastModifiedTime(path).toMillis))
-          bytes <- Boundary.attempt("Чтение исходного файла")(Files.readAllBytes(path))
-          digest <- Crypto.hash(cfg.hashAlgorithm, bytes)
-          after <- Boundary.attempt("Свойства исходного файла")((Files.size(path), Files.getLastModifiedTime(path).toMillis))
-          _ <- if before == after && after == (file.size, file.mtime) && digest == file.hash then Right(())
-               else Left(AppError.FileChanged(path.toString))
-        yield (file, bytes)
-      }
-      val saved = attempted.flatMap(_.toOption)
-      val deletionChecks = plan.report.deleted.map { record =>
-        for
-          source <- record.srcIndex.flatMap(meta.sources.lift).toRight(AppError.FileChanged(record.rel))
-          _ <- Either.cond(source.available, (), AppError.SourceMissing(source.path))
-          _ <- Scanner.resolveRel(meta, record.rel).filter(path => Files.notExists(path) || Files.isDirectory(path))
-            .toRight(AppError.FileChanged(record.rel))
-        yield record
-      }
-      val deleted = deletionChecks.flatMap(_.toOption)
-      val problems = plan.problems ++ attempted.flatMap(_.left.toOption) ++ deletionChecks.flatMap(_.left.toOption)
-      val snapshot = meta.lastVersion.map(_.snapshot).getOrElse(Map.empty) ++
-        saved.map { case (file, _) => file.rel -> FileRef(Some(file.hash), file.size) } ++
-        deleted.map(record => record.rel -> FileRef(None, 0L))
-      val newPaths = plan.report.newFiles.map(_.rel).toSet
-      val (added, modified) = saved.map(_._1.rel).partition(newPaths)
+    if cfg.maximumVersionsPerFile < 1 then Left(AppError.InvalidConfig("Максимальное количество версий меньше единицы"))
+    else keyFor(meta, key).flatMap { actualKey =>
+      val changedFiles = plan.report.changed.map { case (_, file) => file }
+      val files = plan.report.newFiles ++ changedFiles
+      var saved = List.empty[SavedFile]
+      var deleted = List.empty[LastRecord]
+      var problems = plan.problems
+      val failedSources = ArrayBuffer.empty[Int]
+
+      def markFailedSource(rel: String): Unit =
+        val sourceIndex = Scanner.sourceIndexOf(rel)
+        sourceIndex match
+          case Some(index) => failedSources += index
+          case None => ()
+
+      for file <- files do
+        readSource(meta, cfg, file) match
+          case Right(value) => saved = saved :+ value
+          case Left(error) =>
+            problems = problems :+ error
+            markFailedSource(file.rel)
+
+      for record <- plan.report.deleted do
+        checkDeletion(meta, record) match
+          case Right(value) => deleted = deleted :+ value
+          case Left(error) =>
+            problems = problems :+ error
+            markFailedSource(record.rel)
+
+      // Начинаем со старого снимка: пропущенный файл сохраняет прежнюю копию.
+      var snapshot = meta.lastVersion.map(_.snapshot).getOrElse(Map.empty)
+      for item <- saved do
+        val ref = FileRef(Some(item.file.hash), item.file.size)
+        snapshot = snapshot.updated(item.file.rel, ref)
+      for record <- deleted do
+        snapshot = snapshot.updated(record.rel, FileRef(None, 0L))
+      val newPaths = plan.report.newFiles.map(file => file.rel)
+      val savedPaths = saved.map(item => item.file.rel)
+      val added = savedPaths.filter(path => newPaths.contains(path))
+      val modified = savedPaths.filter(path => !newPaths.contains(path))
+      var renamed = List.empty[(String, String)]
+      for (old, fresh) <- plan.report.renamed do
+        val oldWasDeleted = deleted.exists(record => record.rel == old.rel)
+        val newWasSaved = added.contains(fresh.rel)
+        if oldWasDeleted && newWasSaved then
+          renamed = renamed :+ ((old.rel, fresh.rel))
       val timestamp = now()
-      val version = VersionInfo(meta.versions.map(_.number).maxOption.getOrElse(0) + 1, timestamp,
-        comment, if problems.isEmpty then "success" else "partial", added, modified, deleted.map(_.rel),
-        plan.report.renamed.filter { case (old, fresh) => deleted.exists(_.rel == old.rel) && added.contains(fresh.rel) }
-          .map { case (old, fresh) => old.rel -> fresh.rel }, saved.map(_._1.size).sum, snapshot)
-      val failedFiles = files.zip(attempted).collect { case (file, Left(_)) => file.rel } ++
-        plan.report.deleted.zip(deletionChecks).collect { case (record, Left(_)) => record.rel }
-      val failedSources = failedFiles.flatMap(Scanner.sourceIndexOf).toSet
+      val number = meta.lastVersion.map(_.number + 1).getOrElse(1)
+      val sizes = saved.map(item => item.file.size)
+      val bytes = sizes.sum
+      val version = VersionInfo(number, timestamp, comment,
+        if problems.isEmpty then "success" else "partial",
+        added, modified, deleted.map(_.rel), renamed, bytes, snapshot)
+
       val sources = meta.sources.zipWithIndex.map { case (source, index) =>
-        if plan.scannedSources(index) && !failedSources(index) && source.available then source.copy(lastBackup = Some(timestamp))
+        var successful = plan.scannedSources.contains(index)
+        if failedSources.contains(index) then successful = false
+        if !source.available then successful = false
+        if successful then
+          source.copy(lastBackup = Some(timestamp))
         else source
       }
       val updated = retain(meta.copy(versions = meta.versions :+ version, sources = sources), cfg.maximumVersionsPerFile)
-      val blobs = saved.map { case (file, bytes) => file.hash -> bytes }.toMap
+      var blobs = Map.empty[String, Array[Byte]]
+      for item <- saved do
+        blobs = blobs.updated(item.file.hash, item.bytes)
       if Files.notExists(meta.containerPath) then Left(AppError.FileMissing(meta.containerPath.toString))
-      else writeZip(updated, blobs, actualKey).map { _ =>
-        (updated, BackupResult(version, added.size, modified.size, deleted.size, problems.size, version.bytes, problems))
+      else ContainerFile.write(updated, blobs, actualKey, true).map { _ =>
+        val result = BackupResult(version, added.size, modified.size, deleted.size, problems.size, bytes, problems)
+        (updated, result)
       }
     }
 
-  // Проверка целостности предшествует замене файла назначения.
   private def plainBlob(zip: ZipFile, hash: String, key: Option[String]): Either[AppError, Array[Byte]] =
-    for
-      stored <- entryBytes(zip, BlobPrefix + hash)
-      bytes <- key.fold[Either[AppError, Array[Byte]]](Right(stored))(Crypto.decrypt(_, stored))
-      actual <- Crypto.hash(if hash.length == 32 then "MD5" else "SHA-256", bytes)
-      _ <- Either.cond(actual == hash, (), AppError.DamagedStorage(s"Повреждён блок $hash"))
-    yield bytes
-
-  private def versionOf(meta: StorageMeta, number: Int): Either[AppError, VersionInfo] =
-    meta.versions.find(_.number == number).toRight(AppError.VersionNotFound(number))
-
-  // Проверка границ каталога назначения и символьных ссылок.
-  private def safeTarget(dest: Path, rel: String): Either[AppError, Path] =
-    Boundary.attempt("Проверка пути восстановления") {
-      val root = dest.toAbsolutePath.normalize
-      val target = root.resolve(rel).normalize
-      var parent = Option(target)
-      var symlink = false
-      while parent.exists(_.startsWith(root)) && !symlink do
-        symlink = parent.exists(Files.isSymbolicLink(_))
-        parent = parent.flatMap(path => Option(path.getParent))
-      (root, target, symlink)
-    }.flatMap { case (root, target, symlink) =>
-      if Scanner.sourceIndexOf(rel).isEmpty || !target.startsWith(root) || target == root || symlink then
-        Left(AppError.DamagedStorage(s"Небезопасный путь восстановления: $rel"))
-      else Right(target)
+    ContainerFile.entryBytes(zip, ContainerFile.BlobPrefix + hash).flatMap { stored =>
+      val decoded = key match
+        case None => Right(stored)
+        case Some(value) => Crypto.decrypt(value, stored)
+      decoded.flatMap { bytes =>
+        val algorithm = if hash.length == 32 then "MD5" else "SHA-256"
+        Crypto.hash(algorithm, bytes).flatMap { actual =>
+          if actual == hash then Right(bytes)
+          else Left(AppError.DamagedStorage(s"Повреждён блок $hash"))
+        }
+      }
     }
 
-  // Предварительное выявление конфликтов путей назначения для выбранного снимка.
+  private def versionOf(meta: StorageMeta, number: Int): Either[AppError, VersionInfo] =
+    val version = meta.versions.find(version => version.number == number)
+    version match
+      case Some(value) => Right(value)
+      case None => Left(AppError.VersionNotFound(number))
+
+  // Ссылка — путь-перенаправление. Восстанавливать через неё нельзя.
+  private def containsLink(path: Path, root: Path): Boolean =
+    var current = path
+    var found = Files.isSymbolicLink(current)
+    while current != root && !found do
+      current = current.getParent
+      found = Files.isSymbolicLink(current)
+    found
+
+  private def safeTarget(dest: Path, rel: String): Either[AppError, Path] =
+    try
+      val root = dest.toAbsolutePath.normalize
+      val target = root.resolve(rel).normalize
+      if Scanner.sourceIndexOf(rel).isEmpty || !target.startsWith(root) || target == root then
+        Left(AppError.DamagedStorage(s"Путь выходит за каталог восстановления: $rel"))
+      else if containsLink(target, root) then
+        Left(AppError.DamagedStorage(s"В пути восстановления есть ссылка: $rel"))
+      else Right(target)
+    catch case NonFatal(_) => Left(AppError.InvalidPath("Не удалось получить путь восстановления: " + rel))
+
   def restoreConflicts(meta: StorageMeta, number: Int, dest: Path): Either[AppError, List[String]] =
     versionOf(meta, number).flatMap { version =>
-      version.snapshot.toList.filter(_._2.hash.nonEmpty).sortBy(_._1)
-        .foldLeft[Either[AppError, List[String]]](Right(Nil)) { case (result, (rel, _)) =>
-          result.flatMap(all => safeTarget(dest, rel).map(path => if Files.exists(path) then all :+ rel else all))
-        }
+      var conflicts = List.empty[String]
+      var problem: Option[AppError] = None
+      for (rel, ref) <- version.snapshot do
+        if ref.hash.nonEmpty && problem.isEmpty then
+          safeTarget(dest, rel) match
+            case Left(error) => problem = Some(error)
+            case Right(path) =>
+              if Files.exists(path) then conflicts = conflicts :+ rel
+      problem match
+        case Some(error) => Left(error)
+        case None => Right(conflicts.sorted)
+    }
+
+  private def restoreFile(zip: ZipFile, key: Option[String], dest: Path,
+                          rel: String, hash: String, overwrite: Boolean): Either[AppError, Boolean] =
+    safeTarget(dest, rel).flatMap { target =>
+      if Files.exists(target) && !overwrite then Right(false)
+      else plainBlob(zip, hash, key).flatMap { bytes =>
+        try
+          // Java API создаёт недостающие родительские каталоги файла.
+          Files.createDirectories(target.getParent)
+          val temp = Files.createTempFile(target.getParent, "restore-", ".tmp")
+          try
+            Files.write(temp, bytes)
+            if overwrite then Files.move(temp, target, StandardCopyOption.REPLACE_EXISTING)
+            else Files.move(temp, target)
+            Right(true)
+          finally Files.deleteIfExists(temp)
+        catch case NonFatal(_) => Left(AppError.RestoreFailed(rel))
+      }
     }
 
   def restore(meta: StorageMeta, key: Option[String], versionNumber: Int,
-              destDir: Path, overwrite: Set[String] = Set.empty,
+              destDir: Path, overwrite: List[String] = Nil,
               skipExisting: Boolean = true): Either[AppError, RestoreResult] =
-    for
-      actualKey <- keyFor(meta, key)
-      version <- versionOf(meta, versionNumber)
-      _ <- if Files.isDirectory(destDir) && Files.isWritable(destDir) then Right(())
-           else Left(AppError.Io("Восстановление", s"Каталог недоступен: $destDir"))
-      result <- withZip(meta.containerPath) { zip =>
-        val results = for
-          (rel, ref) <- version.snapshot.toList.sortBy(_._1)
-          hash <- ref.hash.toList
-        yield
-          for
-            target <- safeTarget(destDir, rel)
-            allowed = !skipExisting || overwrite(rel)
-            count <- if Files.exists(target) && !allowed then Right(false)
-              else plainBlob(zip, hash, actualKey).flatMap { bytes =>
-                Boundary.attempt("Восстановление файла") {
-                  Files.createDirectories(target.getParent)
-                  replaceFile(target, allowed)(temp => Files.write(temp, bytes))
-                  true
+    keyFor(meta, key).flatMap { actualKey =>
+      versionOf(meta, versionNumber).flatMap { version =>
+        if !Files.isDirectory(destDir) then
+          Left(AppError.DestinationUnavailable(destDir.toString))
+        else
+          try
+            val zip = new ZipFile(meta.containerPath.toFile)
+            try
+              var restored = 0
+              var skipped = 0
+              var problems = List.empty[AppError]
+              val entries = version.snapshot.toList
+              val files = entries.sortBy { case (rel, _) => rel }
+              for (rel, ref) <- files do
+                ref.hash.foreach { hash =>
+                  val replace = !skipExisting || overwrite.contains(rel)
+                  restoreFile(zip, actualKey, destDir, rel, hash, replace) match
+                    case Right(true) => restored += 1
+                    case Right(false) => skipped += 1
+                    case Left(error) =>
+                      skipped += 1
+                      problems = problems :+ error
                 }
-              }
-          yield count
-        Right(RestoreResult(results.count(_ == Right(true)), results.count(_ != Right(true)), results.flatMap(_.left.toOption)))
+              Right(RestoreResult(restored, skipped, problems))
+            finally zip.close()
+          catch case NonFatal(_) => Left(AppError.ReadFailed(meta.containerPath.toString))
       }
-    yield result
+    }
 
-  // Проверка уникальных блоков, используемых сохранёнными снимками.
   def verify(meta: StorageMeta, key: Option[String]): Either[AppError, VerifyResult] =
-    keyFor(meta, key).flatMap { actualKey => withZip(meta.containerPath) { zip =>
-      val hashes = meta.versions.flatMap(_.snapshot.values.flatMap(_.hash)).distinct
-      val missing = hashes.filter(hash => Option(zip.getEntry(BlobPrefix + hash)).isEmpty)
-      val checked = hashes.filterNot(missing.contains).map(hash => hash -> plainBlob(zip, hash, actualKey))
-      Right(VerifyResult(checked.count(_._2.isRight), checked.collect { case (hash, Left(_)) => hash }, missing))
-    }}
+    keyFor(meta, key).flatMap { actualKey =>
+      try
+        val zip = new ZipFile(meta.containerPath.toFile)
+        try
+          var hashes = List.empty[String]
+          for version <- meta.versions do
+            for file <- version.snapshot.values do
+              file.hash.foreach { hash =>
+                if !hashes.contains(hash) then hashes = hashes :+ hash
+              }
+          var ok = 0
+          var missing = List.empty[String]
+          var damaged = List.empty[String]
+          for hash <- hashes do
+            val entry = Option(zip.getEntry(ContainerFile.BlobPrefix + hash))
+            if entry.isEmpty then missing = missing :+ hash
+            else plainBlob(zip, hash, actualKey) match
+              case Right(_) => ok += 1
+              case Left(_) => damaged = damaged :+ hash
+          Right(VerifyResult(ok, damaged, missing))
+        finally zip.close()
+      catch case NonFatal(_) => Left(AppError.ReadFailed(meta.containerPath.toString))
+    }
