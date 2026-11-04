@@ -3,6 +3,7 @@ package backup
 import java.nio.charset.StandardCharsets.UTF_8
 import java.nio.file.{FileAlreadyExistsException, Files, NoSuchFileException, Path, StandardCopyOption}
 import java.util.zip.{ZipEntry, ZipException, ZipFile, ZipOutputStream}
+import scala.collection.mutable.ArrayBuffer
 import scala.util.control.NonFatal
 
 // Здесь только устройство ZIP-файла. Сравнение файлов и версии — в Container.
@@ -45,34 +46,32 @@ object ContainerFile:
                             wanted: List[String], extra: List[String]): Unit =
     val old = new ZipFile(target.toFile)
     try
-      var copied = List.empty[String]
-      val entries = old.entries()
-      while entries.hasMoreElements do
-        val entry = entries.nextElement()
-        val name = entry.getName
-        val hash = name.stripPrefix(BlobPrefix)
-        if name.startsWith(BlobPrefix) && wanted.contains(hash) &&
-            !extra.contains(hash) && !copied.contains(hash) then
-          out.putNextEntry(new ZipEntry(name))
-          val input = old.getInputStream(entry)
-          try input.transferTo(out)
-          finally input.close()
-          out.closeEntry()
-          copied = copied :+ hash
+      for hash <- wanted do
+        if !extra.contains(hash) then
+          val name = BlobPrefix + hash
+          val entry = Option(old.getEntry(name))
+          entry match
+            case None => ()
+            case Some(value) =>
+              out.putNextEntry(new ZipEntry(name))
+              val input = old.getInputStream(value)
+              try input.transferTo(out)
+              finally input.close()
+              out.closeEntry()
     finally old.close()
 
   def write(meta: StorageMeta, blobs: Map[String, Array[Byte]],
             key: Option[String], replacing: Boolean): Either[AppError, Unit] =
-    var wanted = List.empty[String]
+    val wanted = ArrayBuffer.empty[String]
     // Получаем хеши всех блоков, которые нужны сохранённым версиям.
     for version <- meta.versions do
       for record <- version.snapshot.values do
         record.hash match
           case Some(hash) =>
-            if !wanted.contains(hash) then wanted = wanted :+ hash
+            if !wanted.contains(hash) then wanted += hash
           case None => ()
 
-    var extra = List.empty[(String, Array[Byte])]
+    val extra = ArrayBuffer.empty[(String, Array[Byte])]
     var problem: Option[AppError] = None
     // Подготавливаем новые блоки. При ошибке шифрования файл не перезаписывается.
     for (hash, bytes) <- blobs do
@@ -82,10 +81,10 @@ object ContainerFile:
           case None => Right(bytes)
         encoded match
           case Left(error) => problem = Some(error)
-          case Right(data) => extra = extra :+ ((hash, data))
+          case Right(data) => extra += ((hash, data))
     problem match
       case Some(error) => Left(error)
-      case None => writePrepared(meta, wanted, extra, replacing)
+      case None => writePrepared(meta, wanted.toList, extra.toList, replacing)
 
   private def writePrepared(meta: StorageMeta, wanted: List[String],
                             extra: List[(String, Array[Byte])], replacing: Boolean): Either[AppError, Unit] =

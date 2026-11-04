@@ -1,6 +1,7 @@
 package backup
 
 import java.nio.file.{Files, Path, Paths, StandardOpenOption}
+import scala.collection.mutable.ArrayBuffer
 import scala.io.StdIn
 import scala.jdk.CollectionConverters.*
 import scala.util.control.NonFatal
@@ -90,36 +91,40 @@ final class Menu(initialConfig: Config):
 
   private def readSource(): Option[Source] =
     val text = read("Путь к файлу или каталогу (Enter — отмена): ")
-    if !running || text.isEmpty then None
-    else path(text) match
-      case None => None
-      case Some(sourcePath) =>
-        val recursive = yes("Копировать также вложенные папки?", true)
-        if !running then None
-        else
-          val exclusions = read("Исключения через запятую (Enter — из конфигурации): ")
-          val words = exclusions.split(",").toList
-          val patterns = if exclusions.isEmpty then cfg.defaultExclusions else words.map(word => word.trim)
-          if !running then None
-          else Source.validate(Source(sourcePath.toString, recursive, patterns)) match
-            case Left(problem) =>
-              error(problem)
-              None
-            case Right(source) => Some(source)
+    if !running || text.isEmpty then return None
+    val sourcePath = path(text) match
+      case None => return None
+      case Some(value) => value
+    val recursive = yes("Копировать также вложенные папки?", true)
+    if !running then return None
+    val exclusions = read("Исключения через запятую (Enter — из конфигурации): ")
+    if !running then return None
+    val words = exclusions.split(",").toList
+    val patterns = if exclusions.isEmpty then cfg.defaultExclusions else words.map(word => word.trim)
+    val source = Source(
+      path = sourcePath.toString,
+      includeSubdirs = recursive,
+      exclusions = patterns
+    )
+    Source.validate(source) match
+      case Left(problem) =>
+        error(problem)
+        None
+      case Right(value) => Some(value)
 
   private def readSources(): Option[List[Source]] =
-    var result = List.empty[Source]
+    val result = ArrayBuffer.empty[Source]
     var more = true
     var cancelled = false
     while running && more do
       readSource() match
         case Some(source) =>
-          result = result :+ source
+          result += source
           more = yes("Добавить ещё файл или папку?")
         case None =>
           cancelled = true
           more = false
-    if running && !cancelled then Some(result) else None
+    if running && !cancelled then Some(result.toList) else None
 
   private def saveSources(meta: StorageMeta, updated: List[Source]): Unit =
     val next = meta.copy(sources = updated)
@@ -135,7 +140,11 @@ final class Menu(initialConfig: Config):
     case SourceAction.ListAll => sources(meta)
     case SourceAction.Add =>
       readSource() match
-        case Some(source) => saveSources(meta, meta.sources :+ source)
+        case Some(source) =>
+          val updated = ArrayBuffer.empty[Source]
+          for old <- meta.sources do updated += old
+          updated += source
+          saveSources(meta, updated.toList)
         case None => ()
     case SourceAction.Edit(number) =>
       meta.sources.lift(number - 1) match
@@ -251,25 +260,38 @@ final class Menu(initialConfig: Config):
     val enteredName = read(s"Имя файла (Enter — ${cfg.defaultContainerName}): ")
     if !running then return
     val filename = if enteredName.isEmpty then cfg.defaultContainerName else enteredName
-    path(directory.toString + "/" + filename).foreach { target =>
-      if Files.exists(target) then error(AppError.FileExists(target.toString))
-      else
-        val encrypted = yes("Зашифровать копии? Для открытия потребуется ключ.")
-        val selectedKey = if running && encrypted then newKey(name) else None
-        if running && (!encrypted || selectedKey.nonEmpty) then
-          val add = yes("Добавить файлы или папки для копирования сейчас?", true)
-          val initial = if add then readSources() else Some(List.empty[Source])
-          if running then initial.foreach { list =>
-            Container.create(target, name, encrypted, selectedKey, list) match
-              case Left(problem) => error(problem)
-              case Right(meta) =>
-                opened = Some(meta)
-                key = selectedKey
-                event("Создание хранилища")
-                println("Хранилище создано.")
-                info(meta)
-          }
-    }
+    val target = path(directory.toString + "/" + filename) match
+      case None => return
+      case Some(value) => value
+    if Files.exists(target) then
+      error(AppError.FileExists(target.toString))
+      return
+    val encrypted = yes("Зашифровать копии? Для открытия потребуется ключ.")
+    if !running then return
+    val selectedKey = if encrypted then newKey(name) else None
+    if !running then return
+    if encrypted && selectedKey.isEmpty then return
+    val add = yes("Добавить файлы или папки для копирования сейчас?", true)
+    if !running then return
+    val initial = if add then readSources() else Some(List.empty[Source])
+    if !running then return
+    val initialSources = initial match
+      case None => return
+      case Some(value) => value
+    Container.create(
+      path = target,
+      name = name,
+      encrypted = encrypted,
+      key = selectedKey,
+      sources = initialSources
+    ) match
+      case Left(problem) => error(problem)
+      case Right(meta) =>
+        opened = Some(meta)
+        key = selectedKey
+        event("Создание хранилища")
+        println("Хранилище создано.")
+        info(meta)
 
   private def savedKey(name: String): Option[String] =
     try Some(Files.readString(keyFile(name)).trim)
@@ -280,29 +302,34 @@ final class Menu(initialConfig: Config):
 
   private def open(): Unit =
     val text = read("Путь к файлу хранилища (Enter — отмена): ")
-    if running && text.nonEmpty then path(text).foreach { target =>
-      Container.readMeta(target) match
-        case Left(problem) => error(problem)
-        case Right(header) =>
-          var selectedKey: Option[String] = None
-          if header.encrypted then
-            val entered = read("Ключ доступа (Enter — загрузить сохранённый ключ): ")
-            if running then selectedKey = if entered.isEmpty then savedKey(header.name) else Some(entered)
-          if running && (!header.encrypted || selectedKey.nonEmpty) then
-            Container.open(target, selectedKey) match
-              case Left(problem) => error(problem)
-              case Right(meta) =>
-                opened = Some(meta)
-                key = selectedKey
-                event("Открытие хранилища")
-                info(meta)
-                if cfg.checkOnStorageOpen then scan(meta)
-    }
+    if !running || text.isEmpty then return
+    val target = path(text) match
+      case None => return
+      case Some(value) => value
+    val header = Container.readMeta(target) match
+      case Left(problem) =>
+        error(problem)
+        return
+      case Right(value) => value
+    var selectedKey: Option[String] = None
+    if header.encrypted then
+      val entered = read("Ключ доступа (Enter — загрузить сохранённый ключ): ")
+      if !running then return
+      selectedKey = if entered.isEmpty then savedKey(header.name) else Some(entered)
+      if selectedKey.isEmpty then return
+    Container.open(target, selectedKey) match
+      case Left(problem) => error(problem)
+      case Right(meta) =>
+        opened = Some(meta)
+        key = selectedKey
+        event("Открытие хранилища")
+        info(meta)
+        if cfg.checkOnStorageOpen then scan(meta)
 
   private def scan(meta: StorageMeta): Option[ScanPlan] =
     event("Начало проверки изменений")
-    Scanner.scan(meta, cfg.hashAlgorithm, cfg.defaultExclusions,
-      List(Paths.get(cfg.keyDirectory), Paths.get(cfg.logFile), Config.defaultPath)) match
+    val protectedPaths = List(Paths.get(cfg.keyDirectory), Paths.get(cfg.logFile), Config.defaultPath)
+    Scanner.scan(meta, cfg.hashAlgorithm, cfg.defaultExclusions, protectedPaths) match
       case Left(problem) =>
         error(problem)
         None
@@ -321,50 +348,62 @@ final class Menu(initialConfig: Config):
         Some(plan)
 
   private def backup(meta: StorageMeta, comment: Option[String]): Unit =
-    scan(meta) match
-      case None => ()
-      case Some(plan) =>
-        if plan.report.isEmpty then println("Изменений нет.")
-        else
-          val confirmed = !cfg.confirmBeforeBackup || yes("Сохранить эти изменения в резервную копию?")
-          if running && confirmed then
-            event("Начало резервного копирования")
-            Container.backup(meta, key, cfg, plan, comment) match
-              case Left(problem) => error(problem)
-              case Right((next, result)) =>
-                opened = Some(next)
-                println(s"Версия ${result.version.number}: добавлено ${result.added}, обновлено ${result.updated}, удалено ${result.deleted}, пропущено ${result.skipped}, записано ${result.bytes} байт")
-                for problem <- result.problems do error(problem)
-                event(s"Копирование завершено; новая версия ${result.version.number}; успешно=${result.added + result.updated}, пропущено=${result.skipped}")
+    val plan = scan(meta) match
+      case None => return
+      case Some(value) => value
+    if plan.report.isEmpty then
+      println("Изменений нет.")
+      return
+    var confirmed = true
+    if cfg.confirmBeforeBackup then
+      confirmed = yes("Сохранить эти изменения в резервную копию?")
+    if !running || !confirmed then return
+    event("Начало резервного копирования")
+    Container.backup(meta, key, cfg, plan, comment) match
+      case Left(problem) => error(problem)
+      case Right((next, result)) =>
+        opened = Some(next)
+        println(s"Версия ${result.version.number}: добавлено ${result.added}, обновлено ${result.updated}, удалено ${result.deleted}, пропущено ${result.skipped}, записано ${result.bytes} байт")
+        for problem <- result.problems do error(problem)
+        event(s"Копирование завершено; новая версия ${result.version.number}; успешно=${result.added + result.updated}, пропущено=${result.skipped}")
 
   private def restore(meta: StorageMeta, selected: Option[Int]): Unit =
     val version = selected match
       case Some(_) => selected
       case None => meta.lastVersion.map(value => value.number)
-    version match
-      case None => error(AppError.NoVersions)
-      case Some(number) =>
-        for value <- meta.versions.find(value => value.number == number) do
-          println(s"Результат сохранения версии: ${value.result}")
-        val text = read("Каталог восстановления (Enter — отмена): ")
-        if running && text.nonEmpty then path(text).foreach { destination =>
-          prepareDirectory(destination).flatMap { _ =>
-            Container.restoreConflicts(meta, number, destination)
-          } match
-            case Left(problem) => error(problem)
-            case Right(conflicts) =>
-              var overwrite = List.empty[String]
-              for rel <- conflicts do
-                if running && (!cfg.confirmBeforeRestoreOverwrite || yes(s"Файл $rel уже существует. Заменить его?")) then
-                  overwrite = overwrite :+ rel
-              if running then
-                Container.restore(meta, key, number, destination, overwrite) match
-                  case Left(problem) => error(problem)
-                  case Right(result) =>
-                    println(s"Восстановлено: ${result.restored}; пропущено: ${result.skipped}")
-                    for problem <- result.problems do error(problem)
-                    event(s"Восстановление версии $number: успешно=${result.restored}, пропущено=${result.skipped}")
-        }
+    val number = version match
+      case None =>
+        error(AppError.NoVersions)
+        return
+      case Some(value) => value
+    for value <- meta.versions.find(value => value.number == number) do
+      println(s"Результат сохранения версии: ${value.result}")
+    val text = read("Каталог восстановления (Enter — отмена): ")
+    if !running || text.isEmpty then return
+    val destination = path(text) match
+      case None => return
+      case Some(value) => value
+    val conflicts = prepareDirectory(destination).flatMap { _ =>
+      Container.restoreConflicts(meta, number, destination)
+    } match
+      case Left(problem) =>
+        error(problem)
+        return
+      case Right(value) => value
+    val overwrite = ArrayBuffer.empty[String]
+    for rel <- conflicts do
+      if running then
+        var replace = true
+        if cfg.confirmBeforeRestoreOverwrite then
+          replace = yes(s"Файл $rel уже существует. Заменить его?")
+        if replace then overwrite += rel
+    if !running then return
+    Container.restore(meta, key, number, destination, overwrite.toList) match
+      case Left(problem) => error(problem)
+      case Right(result) =>
+        println(s"Восстановлено: ${result.restored}; пропущено: ${result.skipped}")
+        for problem <- result.problems do error(problem)
+        event(s"Восстановление версии $number: успешно=${result.restored}, пропущено=${result.skipped}")
 
   private def prepareDirectory(directory: Path): Either[AppError, Unit] =
     try

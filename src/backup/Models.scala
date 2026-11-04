@@ -1,6 +1,7 @@
 package backup
 
 import java.nio.file.Path
+import scala.collection.mutable.ArrayBuffer
 import scala.util.control.NonFatal
 
 object ModelJson:
@@ -91,10 +92,22 @@ object StorageMeta:
     val modified = modifiedValues.map(item => item.str)
     val deletedValues = value("deleted").arr.toList
     val deleted = deletedValues.map(item => item.str)
+    val number = value("number").num.toInt
+    val timestamp = value("timestamp").str
+    val comment = ModelJson.readOptionalText(value("comment"))
+    val result = value("result").str
+    val bytes = value("bytes").num.toLong
     VersionInfo(
-      value("number").num.toInt, value("timestamp").str,
-      ModelJson.readOptionalText(value("comment")), value("result").str,
-      added, modified, deleted, renamed, value("bytes").num.toLong, snapshot
+      number = number,
+      timestamp = timestamp,
+      comment = comment,
+      result = result,
+      added = added,
+      modified = modified,
+      deleted = deleted,
+      renamed = renamed,
+      bytes = bytes,
+      snapshot = snapshot
     )
 
   def toJson(meta: StorageMeta): ujson.Value =
@@ -118,31 +131,46 @@ object StorageMeta:
       val format = value("format").num
       if format != 2 then Left(AppError.DamagedStorage("Поддерживается только формат 2"))
       else
+        val name = value("name").str
+        val created = value("created").str
         val encrypted = value("encrypted").bool
-        val check = if encrypted then ModelJson.readOptionalText(value("keyCheck")) else None
+        val keyCheck = if encrypted then ModelJson.readOptionalText(value("keyCheck")) else None
         val sourceValues = value("sources").arr.toList
         val sources = sourceValues.map(source => Source.fromJson(source))
         val versionValues = value("versions").arr.toList
         val versions = versionValues.map(version => versionFromJson(version))
         val cipher = value("cipher").str
-        val meta = StorageMeta(
-          value("name").str, path, encrypted, check, value("created").str,
-          sources, versions, cipher
-        )
-        var badVersion = false
-        var seenNumbers = List.empty[Int]
+        var invalidMetadata = false
+        if name.trim.isEmpty then invalidMetadata = true
+        if created.isEmpty then invalidMetadata = true
+        val seenNumbers = ArrayBuffer.empty[Int]
         for version <- versions do
-          if version.number < 1 || version.bytes < 0 then badVersion = true
-          if seenNumbers.contains(version.number) then badVersion = true
-          seenNumbers = seenNumbers :+ version.number
+          if version.number < 1 then invalidMetadata = true
+          if version.bytes < 0 then invalidMetadata = true
+          if seenNumbers.contains(version.number) then invalidMetadata = true
+          seenNumbers += version.number
           for (_, file) <- version.snapshot do
             val emptyHash = file.hash.exists(hash => hash.isEmpty)
-            if file.size < 0 || emptyHash then badVersion = true
-        val hasKey = meta.keyCheck.exists(key => key.nonEmpty)
-        val badEncryption = meta.encrypted && (!hasKey || meta.cipher != "AES/GCM/NoPadding")
-        if meta.name.trim.isEmpty || meta.created.isEmpty || badVersion || badEncryption then
+            if file.size < 0 then invalidMetadata = true
+            if emptyHash then invalidMetadata = true
+        if encrypted then
+          val hasKey = keyCheck.exists(key => key.nonEmpty)
+          if !hasKey then invalidMetadata = true
+          if cipher != "AES/GCM/NoPadding" then invalidMetadata = true
+        if invalidMetadata then
           Left(AppError.DamagedStorage("Некорректные метаданные"))
-        else Right(meta)
+        else
+          val meta = StorageMeta(
+            name = name,
+            containerPath = path,
+            encrypted = encrypted,
+            keyCheck = keyCheck,
+            created = created,
+            sources = sources,
+            versions = versions,
+            cipher = cipher
+          )
+          Right(meta)
     catch case NonFatal(_) => Left(AppError.DamagedStorage("Некорректный JSON хранилища"))
 
 case class WalkedFile(rel: String, size: Long, mtime: Long, hash: String)
@@ -161,8 +189,14 @@ case class ChangeReport(
     val newBytes = newFiles.map(file => file.size).sum
     val modifiedBytes = changed.map { case (_, file) => file.size }.sum
     newBytes + modifiedBytes
-  def isEmpty: Boolean = newFiles.isEmpty && changed.isEmpty && deleted.isEmpty &&
-    renamed.isEmpty && unreadable.isEmpty && unavailableSources.isEmpty
+  def isEmpty: Boolean =
+    if newFiles.nonEmpty then return false
+    if changed.nonEmpty then return false
+    if deleted.nonEmpty then return false
+    if renamed.nonEmpty then return false
+    if unreadable.nonEmpty then return false
+    if unavailableSources.nonEmpty then return false
+    true
 
 case class ScanPlan(
     report: ChangeReport,

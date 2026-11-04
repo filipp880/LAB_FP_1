@@ -11,11 +11,11 @@ object Scanner:
   // Внутри контейнера пути начинаются с номера источника: s0/photo.jpg.
   def sourceIndexOf(rel: String): Option[Int] =
     val parts = rel.split("/", 2)
-    if parts.length == 2 && parts(0).startsWith("s") then
-      val digits = parts(0).drop(1)
-      val number = digits.toIntOption
-      number.filter(value => value >= 0)
-    else None
+    if parts.length != 2 then return None
+    if !parts(0).startsWith("s") then return None
+    val digits = parts(0).drop(1)
+    val number = digits.toIntOption
+    number.filter(value => value >= 0)
 
   def resolveRel(meta: StorageMeta, rel: String): Option[Path] =
     val source = sourceIndexOf(rel).flatMap(index => meta.sources.lift(index))
@@ -75,7 +75,10 @@ object Scanner:
       val absolutePath = path.toAbsolutePath.normalize()
       val protectedFile = protectedPaths.exists(root => absolutePath.startsWith(root))
       // Символьная ссылка ведёт на другой путь. Не обходим её, чтобы не зациклиться.
-      if !Files.isSymbolicLink(path) && !protectedFile && !excluded(source, within, defaults) then
+      var skipPath = Files.isSymbolicLink(path)
+      if protectedFile then skipPath = true
+      if !skipPath then skipPath = excluded(source, within, defaults)
+      if !skipPath then
         if Files.isDirectory(path) then
           if path == base || source.includeSubdirs then
             readDirectory(path) match
@@ -103,7 +106,9 @@ object Scanner:
     val fileIsAbsent = resolveRel(meta, record.rel).exists { path =>
       Files.notExists(path) || Files.isDirectory(path)
     }
-    sourceWasScanned && fileWasIncluded && fileIsAbsent
+    if !sourceWasScanned then false
+    else if !fileWasIncluded then false
+    else fileIsAbsent
 
   def scan(meta: StorageMeta, algo: String, defaults: List[String],
            protectedPaths: List[Path] = Nil): Either[AppError, ScanPlan] =
@@ -122,10 +127,17 @@ object Scanner:
         val results = walked.toList
         val currentFiles = results.flatMap(result => result.files)
         val current = currentFiles.sortBy(file => file.rel)
-        val last = meta.lastVersion.map(_.snapshot).getOrElse(Map.empty)
+        val last = meta.lastVersion.map(version => version.snapshot).getOrElse(Map.empty)
         val previousEntries = last.toList
         val previous = previousEntries.flatMap { case (rel, ref) =>
-          ref.hash.map(hash => LastRecord(rel, hash, ref.size, sourceIndexOf(rel)))
+          ref.hash.map { hash =>
+            LastRecord(
+              rel = rel,
+              hash = hash,
+              size = ref.size,
+              srcIndex = sourceIndexOf(rel)
+            )
+          }
         }
         val newFiles = current.filter { file =>
           val existedBefore = previous.exists(record => record.rel == file.rel)
@@ -139,9 +151,10 @@ object Scanner:
             case None => ()
 
         // Сбой чтения или отключённый источник не означает, что файлы удалили.
-        var scanned = List.empty[Int]
+        val scannedSources = ArrayBuffer.empty[Int]
         for result <- walked do
-          if result.problems.isEmpty then scanned = scanned :+ result.index
+          if result.problems.isEmpty then scannedSources += result.index
+        val scanned = scannedSources.toList
         val absentFiles = previous.filter { record =>
           val existsNow = current.exists(file => file.rel == record.rel)
           !existsNow && wasDeleted(record, meta, scanned, defaults)
@@ -150,23 +163,36 @@ object Scanner:
 
         // Считаем файл переименованным, если совпали содержимое и размер.
         val renamed = ArrayBuffer.empty[(LastRecord, WalkedFile)]
-        var matchedFiles = List.empty[String]
+        val matchedFiles = ArrayBuffer.empty[String]
         for old <- deleted do
           val replacement = newFiles.find { file =>
-            file.hash == old.hash && file.size == old.size && !matchedFiles.contains(file.rel)
+            if file.hash != old.hash then false
+            else if file.size != old.size then false
+            else !matchedFiles.contains(file.rel)
           }
           replacement match
             case Some(file) =>
               renamed += ((old, file))
-              matchedFiles = matchedFiles :+ file.rel
+              matchedFiles += file.rel
             case None => ()
 
         val errors = results.flatMap(result => result.problems)
         val unavailable = missingPaths.toList
         val missing = unavailable.map(path => AppError.SourceMissing(path))
         val messages = errors.map(error => error.message)
-        val report = ChangeReport(newFiles, changed.toList, deleted, renamed.toList, messages,
-          unavailable, current.size)
-        Right(ScanPlan(report, errors ++ missing, scanned))
+        val report = ChangeReport(
+          newFiles = newFiles,
+          changed = changed.toList,
+          deleted = deleted,
+          renamed = renamed.toList,
+          unreadable = messages,
+          unavailableSources = unavailable,
+          scannedCount = current.size
+        )
+        Right(ScanPlan(
+          report = report,
+          problems = errors ++ missing,
+          scannedSources = scanned
+        ))
       catch case NonFatal(_) => Left(AppError.ScanFailed)
     }

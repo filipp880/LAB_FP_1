@@ -32,14 +32,20 @@ object Source:
     json
 
   def fromJson(value: ujson.Value): Source =
+    val path = value("path").str
+    val includeSubdirs = value("includeSubdirs").bool
     val exclusionValues = value("exclusions").arr.toList
     val exclusions = exclusionValues.map(item => item.str)
+    val enabled = value("enabled").bool
+    val lastBackup = ModelJson.readOptionalText(value("lastBackup"))
     val removed = value("removed").bool
     Source(
-      value("path").str, value("includeSubdirs").bool,
-      exclusions, value("enabled").bool,
-      ModelJson.readOptionalText(value("lastBackup")),
-      removed
+      path = path,
+      includeSubdirs = includeSubdirs,
+      exclusions = exclusions,
+      enabled = enabled,
+      lastBackup = lastBackup,
+      removed = removed
     )
 
   def validate(source: Source): Either[AppError, Source] =

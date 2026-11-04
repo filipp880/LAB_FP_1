@@ -5,12 +5,12 @@ import scala.util.control.NonFatal
 
 object Glob:
   private def compile(pattern: String): Either[AppError, PathMatcher] =
-    if pattern.isEmpty || pattern.contains("\n") || pattern.contains("\r") then
-      Left(AppError.InvalidPattern(pattern))
-    else
-      // Java проверяет шаблоны вроде *.tmp и [abc]. Свой разбор шаблонов не нужен.
-      try Right(FileSystems.getDefault.getPathMatcher("glob:" + pattern))
-      catch case NonFatal(_) => Left(AppError.InvalidPattern(pattern))
+    if pattern.isEmpty then return Left(AppError.InvalidPattern(pattern))
+    if pattern.contains("\n") then return Left(AppError.InvalidPattern(pattern))
+    if pattern.contains("\r") then return Left(AppError.InvalidPattern(pattern))
+    // Java проверяет шаблоны вроде *.tmp и [abc]. Свой разбор шаблонов не нужен.
+    try Right(FileSystems.getDefault.getPathMatcher("glob:" + pattern))
+    catch case NonFatal(_) => Left(AppError.InvalidPattern(pattern))
 
   def isValidPattern(pattern: String): Boolean = compile(pattern).isRight
 

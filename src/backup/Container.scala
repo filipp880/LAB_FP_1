@@ -11,8 +11,6 @@ case class VerifyResult(ok: Int, damaged: List[String], missing: List[String])
 case class RestoreResult(restored: Int, skipped: Int, problems: List[AppError])
 
 object Container:
-  private case class SavedFile(file: WalkedFile, bytes: Array[Byte])
-
   def now(): String =
     val time = LocalDateTime.now()
     val format = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
@@ -75,17 +73,17 @@ object Container:
 
   // Идём от последней версии назад и собираем разные хеши одного файла.
   private def latestHashes(path: String, versions: List[VersionInfo], maximum: Int): List[String] =
-    var hashes = List.empty[String]
+    val hashes = ArrayBuffer.empty[String]
     var index = versions.length - 1
     while index >= 0 && hashes.length < maximum do
       val file = versions(index).snapshot.get(path)
-      val hash = file.flatMap(_.hash)
+      val hash = file.flatMap(record => record.hash)
       hash match
         case Some(value) =>
-          if !hashes.contains(value) then hashes = hashes :+ value
+          if !hashes.contains(value) then hashes += value
         case None => ()
       index -= 1
-    hashes
+    hashes.toList
 
   private def retain(meta: StorageMeta, maximum: Int): StorageMeta =
     val versions = meta.versions.map { version =>
@@ -103,7 +101,7 @@ object Container:
     }
     meta.copy(versions = versions)
 
-  private def readSource(meta: StorageMeta, cfg: Config, file: WalkedFile): Either[AppError, SavedFile] =
+  private def readSource(meta: StorageMeta, cfg: Config, file: WalkedFile): Either[AppError, Array[Byte]] =
     Scanner.resolveRel(meta, file.rel) match
       case None => Left(AppError.FileChanged(file.rel))
       case Some(path) =>
@@ -122,10 +120,14 @@ object Container:
             val sizeAfter = Files.size(path)
             val timeAfter = Files.getLastModifiedTime(path).toMillis
             Crypto.hash(cfg.hashAlgorithm, bytes).flatMap { hash =>
-              if sizeBefore != sizeAfter || timeBefore != timeAfter ||
-                  sizeAfter != file.size || timeAfter != file.mtime || hash != file.hash then
-                Left(AppError.FileChanged(path.toString))
-              else Right(SavedFile(file, bytes))
+              var changed = false
+              if sizeBefore != sizeAfter then changed = true
+              if timeBefore != timeAfter then changed = true
+              if sizeAfter != file.size then changed = true
+              if timeAfter != file.mtime then changed = true
+              if hash != file.hash then changed = true
+              if changed then Left(AppError.FileChanged(path.toString))
+              else Right(bytes)
             }
         catch case NonFatal(_) => Left(AppError.ReadFailed(path.toString))
 
@@ -136,8 +138,11 @@ object Container:
       case Some(value) if !value.available => Left(AppError.SourceMissing(value.path))
       case Some(_) =>
         Scanner.resolveRel(meta, record.rel) match
-          case Some(path) if Files.notExists(path) || Files.isDirectory(path) => Right(record)
-          case _ => Left(AppError.FileChanged(record.rel))
+          case None => Left(AppError.FileChanged(record.rel))
+          case Some(path) =>
+            if Files.notExists(path) then Right(record)
+            else if Files.isDirectory(path) then Right(record)
+            else Left(AppError.FileChanged(record.rel))
 
   def backup(meta: StorageMeta, key: Option[String], cfg: Config, plan: ScanPlan,
              comment: Option[String]): Either[AppError, (StorageMeta, BackupResult)] =
@@ -145,10 +150,17 @@ object Container:
     else keyFor(meta, key).flatMap { actualKey =>
       val changedFiles = plan.report.changed.map { case (_, file) => file }
       val files = plan.report.newFiles ++ changedFiles
-      var saved = List.empty[SavedFile]
-      var deleted = List.empty[LastRecord]
-      var problems = plan.problems
+      val added = ArrayBuffer.empty[String]
+      val modified = ArrayBuffer.empty[String]
+      val deleted = ArrayBuffer.empty[String]
+      val problems = ArrayBuffer.empty[AppError]
+      for problem <- plan.problems do problems += problem
       val failedSources = ArrayBuffer.empty[Int]
+      // Начинаем со старого снимка: пропущенный файл сохраняет прежнюю копию.
+      val previousSnapshot = meta.lastVersion.map(version => version.snapshot)
+      var snapshot = previousSnapshot.getOrElse(Map.empty[String, FileRef])
+      var blobs = Map.empty[String, Array[Byte]]
+      var bytes = 0L
 
       def markFailedSource(rel: String): Unit =
         val sourceIndex = Scanner.sourceIndexOf(rel)
@@ -158,44 +170,50 @@ object Container:
 
       for file <- files do
         readSource(meta, cfg, file) match
-          case Right(value) => saved = saved :+ value
+          case Right(content) =>
+            val ref = FileRef(hash = Some(file.hash), size = file.size)
+            snapshot = snapshot.updated(file.rel, ref)
+            blobs = blobs.updated(file.hash, content)
+            bytes += file.size
+            val isNew = plan.report.newFiles.exists(planned => planned.rel == file.rel)
+            if isNew then added += file.rel
+            else modified += file.rel
           case Left(error) =>
-            problems = problems :+ error
+            problems += error
             markFailedSource(file.rel)
 
       for record <- plan.report.deleted do
         checkDeletion(meta, record) match
-          case Right(value) => deleted = deleted :+ value
+          case Right(value) =>
+            snapshot = snapshot.updated(value.rel, FileRef(hash = None, size = 0L))
+            deleted += value.rel
           case Left(error) =>
-            problems = problems :+ error
+            problems += error
             markFailedSource(record.rel)
 
-      // Начинаем со старого снимка: пропущенный файл сохраняет прежнюю копию.
-      var snapshot = meta.lastVersion.map(_.snapshot).getOrElse(Map.empty)
-      for item <- saved do
-        val ref = FileRef(Some(item.file.hash), item.file.size)
-        snapshot = snapshot.updated(item.file.rel, ref)
-      for record <- deleted do
-        snapshot = snapshot.updated(record.rel, FileRef(None, 0L))
-      val newPaths = plan.report.newFiles.map(file => file.rel)
-      val savedPaths = saved.map(item => item.file.rel)
-      val added = savedPaths.filter(path => newPaths.contains(path))
-      val modified = savedPaths.filter(path => !newPaths.contains(path))
-      var renamed = List.empty[(String, String)]
+      val renamed = ArrayBuffer.empty[(String, String)]
       for (old, fresh) <- plan.report.renamed do
-        val oldWasDeleted = deleted.exists(record => record.rel == old.rel)
+        val oldWasDeleted = deleted.contains(old.rel)
         val newWasSaved = added.contains(fresh.rel)
-        if oldWasDeleted && newWasSaved then
-          renamed = renamed :+ ((old.rel, fresh.rel))
+        if oldWasDeleted then
+          if newWasSaved then renamed += ((old.rel, fresh.rel))
       val timestamp = now()
-      val number = meta.lastVersion.map(_.number + 1).getOrElse(1)
-      val sizes = saved.map(item => item.file.size)
-      val bytes = sizes.sum
-      val version = VersionInfo(number, timestamp, comment,
-        if problems.isEmpty then "success" else "partial",
-        added, modified, deleted.map(_.rel), renamed, bytes, snapshot)
+      val number = meta.lastVersion.map(version => version.number + 1).getOrElse(1)
+      val status = if problems.isEmpty then "success" else "partial"
+      val version = VersionInfo(
+        number = number,
+        timestamp = timestamp,
+        comment = comment,
+        result = status,
+        added = added.toList,
+        modified = modified.toList,
+        deleted = deleted.toList,
+        renamed = renamed.toList,
+        bytes = bytes,
+        snapshot = snapshot
+      )
 
-      val sources = meta.sources.zipWithIndex.map { case (source, index) =>
+      val updatedSources = meta.sources.zipWithIndex.map { case (source, index) =>
         var successful = plan.scannedSources.contains(index)
         if failedSources.contains(index) then successful = false
         if !source.available then successful = false
@@ -203,30 +221,44 @@ object Container:
           source.copy(lastBackup = Some(timestamp))
         else source
       }
-      val updated = retain(meta.copy(versions = meta.versions :+ version, sources = sources), cfg.maximumVersionsPerFile)
-      var blobs = Map.empty[String, Array[Byte]]
-      for item <- saved do
-        blobs = blobs.updated(item.file.hash, item.bytes)
+      val history = ArrayBuffer.empty[VersionInfo]
+      for savedVersion <- meta.versions do history += savedVersion
+      history += version
+      val next = meta.copy(versions = history.toList, sources = updatedSources)
+      val updated = retain(next, cfg.maximumVersionsPerFile)
       if Files.notExists(meta.containerPath) then Left(AppError.FileMissing(meta.containerPath.toString))
-      else ContainerFile.write(updated, blobs, actualKey, true).map { _ =>
-        val result = BackupResult(version, added.size, modified.size, deleted.size, problems.size, bytes, problems)
-        (updated, result)
-      }
+      else
+        val writeResult = ContainerFile.write(updated, blobs, actualKey, replacing = true)
+        writeResult.map { writeCompleted =>
+          val result = BackupResult(
+            version = version,
+            added = added.size,
+            updated = modified.size,
+            deleted = deleted.size,
+            skipped = problems.size,
+            bytes = bytes,
+            problems = problems.toList
+          )
+          (updated, result)
+        }
     }
 
   private def plainBlob(zip: ZipFile, hash: String, key: Option[String]): Either[AppError, Array[Byte]] =
-    ContainerFile.entryBytes(zip, ContainerFile.BlobPrefix + hash).flatMap { stored =>
-      val decoded = key match
+    val storedResult = ContainerFile.entryBytes(zip, ContainerFile.BlobPrefix + hash)
+    val decodedResult = storedResult.flatMap { stored =>
+      key match
         case None => Right(stored)
         case Some(value) => Crypto.decrypt(value, stored)
-      decoded.flatMap { bytes =>
-        val algorithm = if hash.length == 32 then "MD5" else "SHA-256"
-        Crypto.hash(algorithm, bytes).flatMap { actual =>
-          if actual == hash then Right(bytes)
-          else Left(AppError.DamagedStorage(s"Повреждён блок $hash"))
-        }
+    }
+    val checkedResult = decodedResult.flatMap { bytes =>
+      val algorithm = if hash.length == 32 then "MD5" else "SHA-256"
+      val hashResult = Crypto.hash(algorithm, bytes)
+      hashResult.flatMap { actual =>
+        if actual == hash then Right(bytes)
+        else Left(AppError.DamagedStorage(s"Повреждён блок $hash"))
       }
     }
+    checkedResult
 
   private def versionOf(meta: StorageMeta, number: Int): Either[AppError, VersionInfo] =
     val version = meta.versions.find(version => version.number == number)
@@ -247,7 +279,11 @@ object Container:
     try
       val root = dest.toAbsolutePath.normalize
       val target = root.resolve(rel).normalize
-      if Scanner.sourceIndexOf(rel).isEmpty || !target.startsWith(root) || target == root then
+      var unsafe = false
+      if Scanner.sourceIndexOf(rel).isEmpty then unsafe = true
+      if !target.startsWith(root) then unsafe = true
+      if target == root then unsafe = true
+      if unsafe then
         Left(AppError.DamagedStorage(s"Путь выходит за каталог восстановления: $rel"))
       else if containsLink(target, root) then
         Left(AppError.DamagedStorage(s"В пути восстановления есть ссылка: $rel"))
@@ -256,17 +292,19 @@ object Container:
 
   def restoreConflicts(meta: StorageMeta, number: Int, dest: Path): Either[AppError, List[String]] =
     versionOf(meta, number).flatMap { version =>
-      var conflicts = List.empty[String]
+      val conflicts = ArrayBuffer.empty[String]
       var problem: Option[AppError] = None
       for (rel, ref) <- version.snapshot do
         if ref.hash.nonEmpty && problem.isEmpty then
           safeTarget(dest, rel) match
             case Left(error) => problem = Some(error)
             case Right(path) =>
-              if Files.exists(path) then conflicts = conflicts :+ rel
+              if Files.exists(path) then conflicts += rel
       problem match
         case Some(error) => Left(error)
-        case None => Right(conflicts.sorted)
+        case None =>
+          val paths = conflicts.toList
+          Right(paths.sorted)
     }
 
   private def restoreFile(zip: ZipFile, key: Option[String], dest: Path,
@@ -301,20 +339,22 @@ object Container:
             try
               var restored = 0
               var skipped = 0
-              var problems = List.empty[AppError]
+              val problems = ArrayBuffer.empty[AppError]
               val entries = version.snapshot.toList
               val files = entries.sortBy { case (rel, _) => rel }
               for (rel, ref) <- files do
-                ref.hash.foreach { hash =>
-                  val replace = !skipExisting || overwrite.contains(rel)
-                  restoreFile(zip, actualKey, destDir, rel, hash, replace) match
-                    case Right(true) => restored += 1
-                    case Right(false) => skipped += 1
-                    case Left(error) =>
-                      skipped += 1
-                      problems = problems :+ error
-                }
-              Right(RestoreResult(restored, skipped, problems))
+                ref.hash match
+                  case None => ()
+                  case Some(hash) =>
+                    var replace = !skipExisting
+                    if overwrite.contains(rel) then replace = true
+                    restoreFile(zip, actualKey, destDir, rel, hash, replace) match
+                      case Right(true) => restored += 1
+                      case Right(false) => skipped += 1
+                      case Left(error) =>
+                        skipped += 1
+                        problems += error
+              Right(RestoreResult(restored = restored, skipped = skipped, problems = problems.toList))
             finally zip.close()
           catch case NonFatal(_) => Left(AppError.ReadFailed(meta.containerPath.toString))
       }
@@ -325,22 +365,23 @@ object Container:
       try
         val zip = new ZipFile(meta.containerPath.toFile)
         try
-          var hashes = List.empty[String]
+          val hashes = ArrayBuffer.empty[String]
           for version <- meta.versions do
             for file <- version.snapshot.values do
-              file.hash.foreach { hash =>
-                if !hashes.contains(hash) then hashes = hashes :+ hash
-              }
+              file.hash match
+                case Some(hash) =>
+                  if !hashes.contains(hash) then hashes += hash
+                case None => ()
           var ok = 0
-          var missing = List.empty[String]
-          var damaged = List.empty[String]
+          val missing = ArrayBuffer.empty[String]
+          val damaged = ArrayBuffer.empty[String]
           for hash <- hashes do
             val entry = Option(zip.getEntry(ContainerFile.BlobPrefix + hash))
-            if entry.isEmpty then missing = missing :+ hash
+            if entry.isEmpty then missing += hash
             else plainBlob(zip, hash, actualKey) match
               case Right(_) => ok += 1
-              case Left(_) => damaged = damaged :+ hash
-          Right(VerifyResult(ok, damaged, missing))
+              case Left(_) => damaged += hash
+          Right(VerifyResult(ok = ok, damaged = damaged.toList, missing = missing.toList))
         finally zip.close()
       catch case NonFatal(_) => Left(AppError.ReadFailed(meta.containerPath.toString))
     }

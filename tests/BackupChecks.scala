@@ -458,4 +458,76 @@ import scala.jdk.CollectionConverters.*
     assert(result.restored == 0 && result.problems.nonEmpty)
     assert(!Files.exists(root.resolve("outside.txt")))
   }
+  check("смешанная копия: новые, изменённые, удалённые и пропущенные файлы") {
+    val directory = Files.createDirectory(root.resolve("combined-source"))
+    val path = root.resolve("combined.store")
+    put(directory.resolve("updated.txt"), "old")
+    put(directory.resolve("deleted.txt"), "remove")
+    put(directory.resolve("racing.txt"), "safe")
+    put(directory.resolve("unchanged.txt"), "keep")
+    val empty = value(Container.create(
+      path = path,
+      name = "Combined changes",
+      encrypted = false,
+      key = None,
+      sources = List(Source(path = directory.toString, includeSubdirs = true, exclusions = Nil))
+    ))
+    val first = backup(empty)._1
+    assert(first.sources.head.lastBackup.nonEmpty)
+
+    // Фиксированная прежняя дата отличима от новой даже при быстром выполнении теста.
+    val previousDate = Some("2000-01-01 00:00:00")
+    val sources = first.sources.map(source => source.copy(lastBackup = previousDate))
+    value(Container.save(first.copy(sources = sources), None))
+    val previous = value(Container.open(path, None))
+
+    put(directory.resolve("new.txt"), "new data")
+    put(directory.resolve("updated.txt"), "changed")
+    Files.delete(directory.resolve("deleted.txt"))
+    put(directory.resolve("racing.txt"), "planned")
+    val plan = scan(previous)
+    put(directory.resolve("racing.txt"), "changed after scan")
+    val (next, result) = value(Container.backup(previous, None, cfg, plan, None))
+
+    assert(result.added == 1)
+    assert(result.updated == 1)
+    assert(result.deleted == 1)
+    assert(result.skipped == 1)
+    assert(result.bytes == 15)
+    assert(result.version.number == 2)
+    assert(result.version.added == List("s0/new.txt"))
+    assert(result.version.modified == List("s0/updated.txt"))
+    assert(result.version.deleted == List("s0/deleted.txt"))
+    assert(result.version.renamed.isEmpty)
+    assert(result.problems == List(AppError.FileChanged(directory.resolve("racing.txt").toString)))
+    val oldRacing = previous.lastVersion.flatMap(version => version.snapshot.get("s0/racing.txt"))
+    val savedRacing = next.lastVersion.flatMap(version => version.snapshot.get("s0/racing.txt"))
+    assert(oldRacing.nonEmpty && savedRacing == oldRacing)
+    assert(next.sources.head.lastBackup == previousDate)
+
+    val reopened = value(Container.open(path, None))
+    assert(reopened.versions == next.versions)
+    assert(reopened.sources.head.lastBackup == previousDate)
+    val verified = value(Container.verify(reopened, None))
+    assert(verified.ok == 6)
+    assert(verified.damaged.isEmpty && verified.missing.isEmpty)
+
+    val latestDestination = Files.createDirectory(root.resolve("restore-combined-latest"))
+    val latest = value(Container.restore(reopened, None, 2, latestDestination))
+    assert(latest.restored == 4 && latest.skipped == 0 && latest.problems.isEmpty)
+    assert(text(latestDestination.resolve("s0/new.txt")) == "new data")
+    assert(text(latestDestination.resolve("s0/updated.txt")) == "changed")
+    assert(text(latestDestination.resolve("s0/racing.txt")) == "safe")
+    assert(text(latestDestination.resolve("s0/unchanged.txt")) == "keep")
+    assert(!Files.exists(latestDestination.resolve("s0/deleted.txt")))
+
+    val oldDestination = Files.createDirectory(root.resolve("restore-combined-old"))
+    val old = value(Container.restore(reopened, None, 1, oldDestination))
+    assert(old.restored == 4 && old.skipped == 0 && old.problems.isEmpty)
+    assert(text(oldDestination.resolve("s0/updated.txt")) == "old")
+    assert(text(oldDestination.resolve("s0/deleted.txt")) == "remove")
+    assert(text(oldDestination.resolve("s0/racing.txt")) == "safe")
+    assert(text(oldDestination.resolve("s0/unchanged.txt")) == "keep")
+    assert(!Files.exists(oldDestination.resolve("s0/new.txt")))
+  }
   println(s"Проверок пройдено: $passed. Временные данные: $root")

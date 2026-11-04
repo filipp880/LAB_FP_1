@@ -17,8 +17,17 @@ case class Config(
 )
 
 object Config:
-  val Default = Config("backup.log", "keys", "backup.store", true, true, true,
-    10, "SHA-256", List("*.tmp", "*.log", "cache", "node_modules"))
+  val Default = Config(
+    logFile = "backup.log",
+    keyDirectory = "keys",
+    defaultContainerName = "backup.store",
+    checkOnStorageOpen = true,
+    confirmBeforeBackup = true,
+    confirmBeforeRestoreOverwrite = true,
+    maximumVersionsPerFile = 10,
+    hashAlgorithm = "SHA-256",
+    defaultExclusions = List("*.tmp", "*.log", "cache", "node_modules")
+  )
   val defaultPath: Path = Paths.get("backup.json")
 
   // str читает строку JSON, bool — логическое значение, num — число.
@@ -32,17 +41,18 @@ object Config:
       if maximum != wholeNumber.toDouble then
         Left(AppError.InvalidConfig("Число версий должно быть целым Int"))
       else
-        Right(Config(
-          json("logFile").str,
-          json("keyDirectory").str,
-          json("defaultContainerName").str,
-          json("checkOnStorageOpen").bool,
-          json("confirmBeforeBackup").bool,
-          json("confirmBeforeRestoreOverwrite").bool,
-          wholeNumber,
-          json("hashAlgorithm").str,
-          exclusions
-        ))
+        val config = Config(
+          logFile = json("logFile").str,
+          keyDirectory = json("keyDirectory").str,
+          defaultContainerName = json("defaultContainerName").str,
+          checkOnStorageOpen = json("checkOnStorageOpen").bool,
+          confirmBeforeBackup = json("confirmBeforeBackup").bool,
+          confirmBeforeRestoreOverwrite = json("confirmBeforeRestoreOverwrite").bool,
+          maximumVersionsPerFile = wholeNumber,
+          hashAlgorithm = json("hashAlgorithm").str,
+          defaultExclusions = exclusions
+        )
+        Right(config)
     catch case NonFatal(_) => Left(AppError.InvalidConfig("Неправильный формат JSON или тип поля"))
 
   def toJson(config: Config): ujson.Value =
@@ -60,8 +70,11 @@ object Config:
 
   def load(path: Path): Either[AppError, Config] =
     try
-      parse(Files.readString(path, UTF_8)).flatMap { config =>
-        validate(config).map(_ => config)
+      val text = Files.readString(path, UTF_8)
+      val parsed = parse(text)
+      parsed.flatMap { config =>
+        val validation = validate(config)
+        validation.map(result => config)
       }
     catch
       case _: NoSuchFileException => Left(AppError.FileMissing(path.toString))
@@ -84,8 +97,12 @@ object Config:
       val log = Paths.get(config.logFile)
       val keys = Paths.get(config.keyDirectory)
       val name = config.defaultContainerName
-      val hasDirectory = name.contains("/") || name.contains("\\")
-      if hasDirectory || name == "." || name == ".." then
+      var invalidName = false
+      if name.contains("/") then invalidName = true
+      if name.contains("\\") then invalidName = true
+      if name == "." then invalidName = true
+      if name == ".." then invalidName = true
+      if invalidName then
         Left(AppError.InvalidConfig("Имя контейнера должно быть именем файла без каталога"))
       else if Files.exists(keys) && !Files.isDirectory(keys) then
         Left(AppError.InvalidConfig("По пути каталога ключей находится файл"))
