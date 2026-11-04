@@ -63,8 +63,7 @@ object Container:
       keyCheck = keyCheck,
       created = now(),
       sources = sources,
-      versions = List.empty[VersionInfo],
-      fileVersions = Map.empty[String, List[Int]]
+      versions = List.empty[VersionInfo]
     )
     val fileContents = Map.empty[String, Array[Byte]]
     val writeResult = ContainerFile.write(meta, fileContents, key = None, replacing = false)
@@ -102,23 +101,7 @@ object Container:
         else version.result
       version.copy(snapshot = snapshot, result = result)
     }
-    var paths = List.empty[String]
-    for version <- versions do
-      for path <- version.snapshot.keys do
-        if !paths.contains(path) then paths = paths :+ path
-
-    var fileVersions = Map.empty[String, List[Int]]
-    for path <- paths do
-      var numbers = List.empty[Int]
-      for version <- versions.reverse do
-        val wasChanged = version.added.contains(path) || version.modified.contains(path)
-        val file = version.snapshot.get(path)
-        val hash = file.flatMap(record => record.hash)
-        val hasContent = hash.nonEmpty
-        if wasChanged && hasContent && numbers.length < maximum then
-          numbers = version.number :: numbers
-      if numbers.nonEmpty then fileVersions = fileVersions.updated(path, numbers)
-    meta.copy(versions = versions, fileVersions = fileVersions)
+    meta.copy(versions = versions)
 
   private def readSource(meta: StorageMeta, cfg: Config, file: WalkedFile): Either[AppError, SavedFile] =
     Scanner.resolveRel(meta, file.rel) match

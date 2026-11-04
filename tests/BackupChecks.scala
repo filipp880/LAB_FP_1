@@ -143,38 +143,65 @@ import scala.jdk.CollectionConverters.*
     assert(verified.ok == 2 && verified.damaged.isEmpty && verified.missing.isEmpty)
     assert(scan(meta).report.isEmpty)
   }
-  check("совместимость: контейнер ЛР0 без шифрования и явный отказ от старого XOR") {
-    val legacy = StorageMeta.toJson(meta)
-    legacy("format") = 1
-    legacy("keyCheck") = ""
-    legacy.obj.remove("cipher")
-    legacy("sources").arr.foreach(_.obj.remove("removed"))
-    val legacyPath = root.resolve("legacy.store")
-    val zip = new ZipFile(store.toFile)
-    try
-      val out = new ZipOutputStream(Files.newOutputStream(legacyPath))
-      try zip.entries().asScala.foreach { entry =>
-        out.putNextEntry(new ZipEntry(entry.getName))
-        if entry.getName == "meta/filerecords.json" then out.write(ujson.write(legacy).getBytes(java.nio.charset.StandardCharsets.UTF_8))
-        else
-          val in = zip.getInputStream(entry)
-          try in.transferTo(out)
-          finally in.close()
-        out.closeEntry()
-      }
-      finally out.close()
-    finally zip.close()
-    val opened = value(Container.open(legacyPath, None))
+  check("формат 2: история без fileVersions и отказ от старых форматов") {
+    val json = StorageMeta.toJson(meta)
+    assert(json("format").num == 2)
+    assert(!json.obj.contains("fileVersions"))
+    val decoded = value(StorageMeta.fromJson(json, store))
+    assert(decoded.versions == meta.versions)
+    assert(decoded.sources == meta.sources)
+
+    val opened = value(Container.open(store, None))
     assert(opened.versions == meta.versions)
-    val destination = Files.createDirectory(root.resolve("restore-legacy"))
-    value(Container.restore(opened, None, 1, destination))
+    assert(opened.sources == meta.sources)
+    val destination = Files.createDirectory(root.resolve("restore-format2"))
+    val restored = value(Container.restore(opened, None, 1, destination))
+    assert(restored.problems.isEmpty && restored.restored == 3)
     assert(text(destination.resolve("s0/a.txt")) == "A")
-    legacy("encrypted") = true
-    legacy("keyCheck") = "legacy-check"
-    assert(StorageMeta.fromJson(legacy, legacyPath).left.toOption.exists {
-      case AppError.DamagedStorage(reason) => reason.contains("ЛР0")
-      case _ => false
-    })
+    assert(text(destination.resolve("s0/b.txt")) == "A")
+    assert(text(destination.resolve("s0/sub/deep.txt")) == "D")
+
+    val withOldField = StorageMeta.toJson(meta)
+    withOldField("fileVersions") = ujson.Obj("s0/a.txt" -> ujson.Arr(1))
+    val withoutOldField = value(StorageMeta.fromJson(withOldField, store))
+    assert(withoutOldField.versions == meta.versions)
+    assert(withoutOldField.sources == meta.sources)
+    assert(!StorageMeta.toJson(withoutOldField).obj.contains("fileVersions"))
+
+    val withoutCipher = StorageMeta.toJson(meta)
+    withoutCipher.obj.remove("cipher")
+    assert(StorageMeta.fromJson(withoutCipher, store).isLeft)
+    val withoutRemoved = StorageMeta.toJson(meta)
+    withoutRemoved("sources").arr(0).obj.remove("removed")
+    assert(StorageMeta.fromJson(withoutRemoved, store).isLeft)
+
+    for format <- List(1, 3) do
+      val unsupported = StorageMeta.toJson(meta)
+      unsupported("format") = format
+      val unsupportedPath = root.resolve(s"unsupported-format-$format.store")
+      val expected = Left(AppError.DamagedStorage("Поддерживается только формат 2"))
+      assert(StorageMeta.fromJson(unsupported, unsupportedPath) == expected)
+      unsupported("encrypted") = true
+      assert(StorageMeta.fromJson(unsupported, unsupportedPath) == expected)
+      val zip = new ZipFile(store.toFile)
+      try
+        val out = new ZipOutputStream(Files.newOutputStream(unsupportedPath))
+        try
+          val entries = zip.entries()
+          while entries.hasMoreElements do
+            val entry = entries.nextElement()
+            out.putNextEntry(new ZipEntry(entry.getName))
+            if entry.getName == "meta/filerecords.json" then
+              val bytes = ujson.write(unsupported).getBytes(java.nio.charset.StandardCharsets.UTF_8)
+              out.write(bytes)
+            else
+              val in = zip.getInputStream(entry)
+              try in.transferTo(out)
+              finally in.close()
+            out.closeEntry()
+        finally out.close()
+      finally zip.close()
+      assert(Container.open(unsupportedPath, None) == expected)
   }
   check("ключи и служебные файлы не включаются в контейнер") {
     val directory = Files.createDirectory(root.resolve("protected-source"))

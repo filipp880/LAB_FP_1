@@ -37,7 +37,6 @@ case class StorageMeta(
     created: String,
     sources: List[Source],
     versions: List[VersionInfo],
-    fileVersions: Map[String, List[Int]],
     cipher: String = "AES/GCM/NoPadding"
 ):
   def lastVersion: Option[VersionInfo] =
@@ -102,9 +101,6 @@ object StorageMeta:
     // Путь файла не сохраняем: контейнер можно перенести в другую папку.
     val sources = meta.sources.map(source => Source.toJson(source))
     val versions = meta.versions.map(version => versionToJson(version))
-    val fileVersions = ujson.Obj()
-    for (path, numbers) <- meta.fileVersions do
-      fileVersions(path) = ujson.Arr.from(numbers)
     val json = ujson.Obj()
     json("format") = 2
     json("name") = meta.name
@@ -113,35 +109,25 @@ object StorageMeta:
     json("created") = meta.created
     json("sources") = ujson.Arr.from(sources)
     json("versions") = ujson.Arr.from(versions)
-    json("fileVersions") = fileVersions
     json("cipher") = meta.cipher
     json
 
-  // Десериализация и валидация метаданных с учётом версии формата.
+  // Читаем и проверяем метаданные единственного поддерживаемого формата.
   def fromJson(value: ujson.Value, path: Path): Either[AppError, StorageMeta] =
     try
       val format = value("format").num
-      if format != 1 && format != 2 then Left(AppError.DamagedStorage("Неподдерживаемый формат"))
-      else if format == 1 && value("encrypted").bool then
-        Left(AppError.DamagedStorage("Старое шифрование: экспортируйте файлы через ЛР0 и создайте новое хранилище"))
+      if format != 2 then Left(AppError.DamagedStorage("Поддерживается только формат 2"))
       else
         val encrypted = value("encrypted").bool
         val check = if encrypted then ModelJson.readOptionalText(value("keyCheck")) else None
-        var history = Map.empty[String, List[Int]]
-        for (filePath, numbers) <- value("fileVersions").obj do
-          val numberValues = numbers.arr.toList
-          val versionNumbers = numberValues.map(number => number.num.toInt)
-          history = history.updated(filePath, versionNumbers)
         val sourceValues = value("sources").arr.toList
         val sources = sourceValues.map(source => Source.fromJson(source))
         val versionValues = value("versions").arr.toList
         val versions = versionValues.map(version => versionFromJson(version))
-        val cipher = value.obj.get("cipher") match
-          case Some(name) => name.str
-          case None => "AES/GCM/NoPadding"
+        val cipher = value("cipher").str
         val meta = StorageMeta(
           value("name").str, path, encrypted, check, value("created").str,
-          sources, versions, history, cipher
+          sources, versions, cipher
         )
         var badVersion = false
         var seenNumbers = List.empty[Int]

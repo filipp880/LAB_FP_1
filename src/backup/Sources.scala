@@ -34,9 +34,7 @@ object Source:
   def fromJson(value: ujson.Value): Source =
     val exclusionValues = value("exclusions").arr.toList
     val exclusions = exclusionValues.map(item => item.str)
-    val removed = value.obj.get("removed") match
-      case Some(flag) => flag.bool
-      case None => false
+    val removed = value("removed").bool
     Source(
       value("path").str, value("includeSubdirs").bool,
       exclusions, value("enabled").bool,
